@@ -3,7 +3,6 @@ name: Deploy All Lambdas Dynamically
 on:
   push:
     branches: [ "main" ]
-
 jobs:
   discover-lambdas:
     name: Discover Lambda Folders
@@ -32,12 +31,13 @@ jobs:
           json=$(echo "$json" | sed 's/ /,/g')
           
           echo "Found folders: $json"
-          echo "::set-output name=folders-json::$json"
+          echo "name=folders-json::$json" >> $GITHUB_OUTPUT
 
   build-and-deploy:
     name: Build and Deploy Each Lambda
     runs-on: ubuntu-latest
     needs: [ discover-lambdas ]
+    environment: main
     strategy:
       fail-fast: false
       matrix:
