@@ -1,0 +1,80 @@
+name: Deploy All Lambdas Dynamically
+
+on:
+  push:
+    branches: [ "main" ]
+
+jobs:
+  discover-lambdas:
+    name: Discover Lambda Folders
+    runs-on: ubuntu-latest
+    outputs:
+      folders-json: ${{ steps.lambdas.outputs.folders-json }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v3
+
+      - name: Find top-level directories
+        id: lambdas
+        run: |
+          # Exclude .github, .idea, infra, docs, etc.
+          dirs=$(ls -d1 */ | sed 's,/,,g' \
+                 | grep -v '^.github$' \
+                 | grep -v '^.idea$' \
+                 | grep -v '^infra$' \
+                 | grep -v '^docs$')
+
+          arr=()
+          for d in $dirs; do
+            arr+=("\"$d\"")
+          done
+          json="[${arr[*]}]"
+          json=$(echo "$json" | sed 's/ /,/g')
+          
+          echo "Found folders: $json"
+          echo "::set-output name=folders-json::$json"
+
+  build-and-deploy:
+    name: Build and Deploy Each Lambda
+    runs-on: ubuntu-latest
+    needs: [ discover-lambdas ]
+    strategy:
+      fail-fast: false
+      matrix:
+        folder: ${{ fromJson(needs.discover-lambdas.outputs.folders-json) }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v3
+
+      - name: Check if folder changed
+        id: check_changes
+        run: |
+          # We'll compare HEAD~1 to HEAD for changes in the subfolder
+          if git diff --quiet HEAD~1 HEAD -- ${{ matrix.folder }}; then
+            echo "changed=false" >> $GITHUB_OUTPUT
+          else
+            echo "changed=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Build Lambda (if changed)
+        if: steps.check_changes.outputs.changed == 'true'
+        run: |
+          chmod +x build-lambda.sh
+          ./build-lambda.sh ${{ matrix.folder }}
+
+      - name: Configure AWS Credentials (if changed)
+        if: steps.check_changes.outputs.changed == 'true'
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Deploy to Lambda (if changed)
+        if: steps.check_changes.outputs.changed == 'true'
+        run: |
+          FUNCTION_NAME="${{ matrix.folder }}"
+          echo "Deploying to Lambda: $FUNCTION_NAME"
+          aws lambda update-function-code \
+            --function-name "$FUNCTION_NAME" \
+            --zip-file fileb://${{ matrix.folder }}/lambda.zip
