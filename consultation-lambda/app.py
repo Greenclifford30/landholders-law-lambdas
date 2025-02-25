@@ -53,6 +53,10 @@ def handler(event, context):
         
         return {
             "statusCode": 200,
+            "headers": {
+            "Access-Control-Allow-Origin": "*",  # Or "https://landholderslaw.com"
+            "Access-Control-Allow-Headers": "Content-Type,Authorization"
+            },
             "body": json.dumps({
                 "message": "Consultation request received."
             })
@@ -62,5 +66,9 @@ def handler(event, context):
         print(f"Error: {str(e)}")
         return {
             "statusCode": 500,
+            "headers": {
+            "Access-Control-Allow-Origin": "*",  # Or "https://landholderslaw.com"
+            "Access-Control-Allow-Headers": "Content-Type,Authorization"
+            },
             "body": json.dumps({"error": "Internal server error"})
         }
