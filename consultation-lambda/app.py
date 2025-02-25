@@ -25,6 +25,7 @@ def handler(event, context):
 
         # Construct the email parameters
         owner_email = os.environ.get("OWNER_EMAIL", "owner@example.com")
+        business_email = os.environ.get("BUSINESS_EMAIL")
         subject = "New Consultation Request"
         message_body = (
             f"Name: {name}\n"
@@ -34,7 +35,7 @@ def handler(event, context):
         )
 
         response = ses.send_email(
-            Source=owner_email,
+            Source=business_email,
             Destination={
                 "ToAddresses": [owner_email],
             },
