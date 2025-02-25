@@ -4,7 +4,7 @@ import boto3
 
 ses = boto3.client('ses')
 
-def lambda_handler(event, context):
+def handler(event, context):
     """
     Receives JSON input from API Gateway with consultation data,
     then sends an email to the business owner via SES.

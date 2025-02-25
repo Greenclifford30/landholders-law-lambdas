@@ -28,7 +28,7 @@ mkdir build
 pip install --upgrade -r requirements.txt -t build
 
 # 4) Copy source code into 'build' folder
-cp handler.py build/
+cp app.py build/
 
 # 5) Create the zip package
 cd build
