@@ -3,6 +3,7 @@ name: Deploy All Lambdas Dynamically
 on:
   push:
     branches: [ "main" ]
+
 jobs:
   discover-lambdas:
     name: Discover Lambda Folders
@@ -13,15 +14,11 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v3
 
-      - name: Find top-level directories
+      - name: Find *-lambda directories under /project/*/
         id: lambdas
         run: |
-          # Exclude .github, .idea, infra, docs, etc.
-          dirs=$(ls -d1 */ | sed 's,/,,g' \
-                 | grep -v '^.github$' \
-                 | grep -v '^.idea$' \
-                 | grep -v '^infra$' \
-                 | grep -v '^docs$')
+          # Find folders like project/*/*-lambda
+          dirs=$(find . -mindepth 2 -maxdepth 2 -type d -name '*-lambda' | sed 's|^\./||')
 
           arr=()
           for d in $dirs; do
@@ -29,9 +26,9 @@ jobs:
           done
           json="[${arr[*]}]"
           json=$(echo "$json" | sed 's/ /,/g')
-          
+
           echo "Found folders: $json"
-          echo "name=folders-json::$json" >> $GITHUB_OUTPUT
+          echo "folders-json=$json" >> $GITHUB_OUTPUT
           echo "::set-output name=folders-json::$json"
 
   build-and-deploy:
@@ -43,6 +40,7 @@ jobs:
       fail-fast: false
       matrix:
         folder: ${{ fromJson(needs.discover-lambdas.outputs.folders-json) }}
+
     steps:
       - name: Check out repository
         uses: actions/checkout@v3
@@ -50,7 +48,6 @@ jobs:
       - name: Check if folder changed
         id: check_changes
         run: |
-          # We'll compare HEAD~1 to HEAD for changes in the subfolder
           if git diff --quiet HEAD~1 HEAD -- ${{ matrix.folder }}; then
             echo "changed=false" >> $GITHUB_OUTPUT
           else
@@ -74,8 +71,12 @@ jobs:
       - name: Deploy to Lambda (if changed)
         if: steps.check_changes.outputs.changed == 'true'
         run: |
-          FUNCTION_NAME="${{ matrix.folder }}"
+          PROJECT=$(echo "${{ matrix.folder }}" | cut -d'/' -f1)
+          LAMBDA_FOLDER=$(echo "${{ matrix.folder }}" | cut -d'/' -f2)
+          FUNCTION_NAME="${PROJECT}-${LAMBDA_FOLDER}"
+
           echo "Deploying to Lambda: $FUNCTION_NAME"
+
           aws lambda update-function-code \
             --function-name "$FUNCTION_NAME" \
             --zip-file fileb://${{ matrix.folder }}/lambda.zip

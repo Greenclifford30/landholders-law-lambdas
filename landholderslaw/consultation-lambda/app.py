@@ -54,8 +54,8 @@ def handler(event, context):
         return {
             "statusCode": 200,
             "headers": {
-            "Access-Control-Allow-Origin": "*",  # Or "https://landholderslaw.com"
-            "Access-Control-Allow-Headers": "Content-Type,Authorization"
+                "Access-Control-Allow-Origin": "*",  # Or "https://landholderslaw.com"
+                "Access-Control-Allow-Headers": "Content-Type,Authorization"
             },
             "body": json.dumps({
                 "message": "Consultation request received."
