@@ -8,7 +8,7 @@ dynamodb = boto3.resource('dynamodb')
 table_name = os.environ.get('DYNAMODB_TABLE', 'ServiceRequests')
 table = dynamodb.Table(table_name)
 
-def lambda_handler(event, context):
+def handler(event, context):
     try:
         # Parse the incoming request body
         body = json.loads(event.get('body', '{}'))
