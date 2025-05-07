@@ -1,7 +1,7 @@
 import json
 import boto3
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from uuid import uuid4
 
 dynamodb = boto3.resource('dynamodb')
@@ -15,7 +15,7 @@ def handler(event, context):
 
         # Generate UUID if not provided
         service_id = body.get('serviceId', str(uuid4()))
-        requested_at = body.get('requestedAt', datetime.now(datetime.timezone.utc).isoformat() + 'Z')
+        requested_at = body.get('requestedAt', datetime.now(timezone.utc))
 
         # Construct the item
         item = {
