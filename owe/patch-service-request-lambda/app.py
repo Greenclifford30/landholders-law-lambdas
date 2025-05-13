@@ -48,9 +48,15 @@ def handler(event, context):
 
         table.update_item(
             Key={'PK': pk, 'SK': sk},
-            UpdateExpression=update_expr,
-            ExpressionAttributeValues=expression_values
+            UpdateExpression="SET #status = :status",
+            ExpressionAttributeNames={
+                "#status": "status"
+            },
+            ExpressionAttributeValues={
+                ":status": body["status"]  # or body["status"]
+            }
         )
+
 
         return {
             "statusCode": 200,
