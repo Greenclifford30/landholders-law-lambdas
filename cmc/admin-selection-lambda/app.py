@@ -115,7 +115,7 @@ def fetch_amc_showtimes_by_movie(movie_title: str, start_date: str) -> list:
     return final_results
 
 
-def lambda_handler(event, context):
+def handler(event, context):
     try:
         body = json.loads(event.get("body", "{}"))
         movie_id = body.get("movieId")

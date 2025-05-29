@@ -5,7 +5,7 @@ import os
 dynamodb = boto3.resource("dynamodb")
 table = dynamodb.Table(os.environ.get("MOVIE_SHOWTIME_OPTIONS_TABLE", "movie_showtime_options"))
 
-def lambda_handler(event, context):
+def handler(event, context):
     try:
         params = event.get("queryStringParameters") or {}
         filter_theater = params.get("theater")  # Optional
