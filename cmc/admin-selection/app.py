@@ -1,6 +1,6 @@
 import html
 import json
-# import boto3
+import boto3
 import os
 from datetime import datetime, timedelta, timezone
 import requests
@@ -8,9 +8,9 @@ from bs4 import BeautifulSoup
 from collections import defaultdict
 
 # Initialize DynamoDB
-# dynamodb = boto3.resource("dynamodb")
-# table_name = os.environ["MOVIE_SHOWTIME_OPTIONS_TABLE"]
-# table = dynamodb.Table(table_name)
+dynamodb = boto3.resource("dynamodb")
+table_name = os.environ["MOVIE_SHOWTIME_OPTIONS_TABLE"]
+table = dynamodb.Table(table_name)
 
 # Hardcoded theater list — you can later move this to a config or DB
 AMC_THEATER_SLUGS = [
