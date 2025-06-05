@@ -12,7 +12,7 @@ def handler(event, context):
         body = json.loads(event.get("body", "{}"))
         movie_id = body.get("movieId")
         movie_title = body.get("movieTitle")
-        show_date = body.get("showDate")
+        show_date = body.get("proposedStartDate")
 
         if not movie_id or not movie_title or not show_date:
             return {
