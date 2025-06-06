@@ -1,6 +1,18 @@
 import json
 import boto3
 import os
+from decimal import Decimal
+
+def clean_decimals(obj):
+    if isinstance(obj, list):
+        return [clean_decimals(v) for v in obj]
+    elif isinstance(obj, dict):
+        return {k: clean_decimals(v) for k, v in obj.items()}
+    elif isinstance(obj, Decimal):
+        # return int(v) if v == int(v) else float(v)
+        return float(obj)
+    else:
+        return obj
 
 dynamodb = boto3.resource("dynamodb")
 table = dynamodb.Table(os.environ.get("MOVIE_SHOWTIME_OPTIONS_TABLE", "movie_showtime_options"))
@@ -40,12 +52,12 @@ def handler(event, context):
 
         return {
             "statusCode": 200,
-            "body": json.dumps({
+            "body": json.dumps(clean_decimals({
                 "movieId": item["movieId"],
                 "movieTitle": item["movieTitle"],
                 "showDate": item["showDate"],
                 "theaters": theaters
-            })
+            }))
         }
 
     except Exception as e:
