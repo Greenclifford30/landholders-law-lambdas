@@ -12,7 +12,7 @@ def handler(event, context):
         filter_date = params.get("date")        # Optional
 
         # Scan the entire table (there should only be one record)
-        response = table.scan(Limit=1)
+        response = table.scan(Limit=14)
         items = response.get("Items", [])
         if not items:
             return {
