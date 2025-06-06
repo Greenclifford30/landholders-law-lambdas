@@ -1,18 +1,17 @@
 import json
 import os
 import boto3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 sqs = boto3.client("sqs")
 QUEUE_URL = os.environ["ADMIN_SELECTION_QUEUE_URL"]
 
-def handler(event, context):
+def lambda_handler(event, context):
     try:
-        # Parse input from API Gateway event body
         body = json.loads(event.get("body", "{}"))
         movie_id = body.get("movieId")
         movie_title = body.get("movieTitle")
-        show_date = body.get("proposedStartDate")
+        show_date = body.get("showDate")
 
         if not movie_id or not movie_title or not show_date:
             return {
@@ -22,20 +21,28 @@ def handler(event, context):
                 })
             }
 
-        # Append submission timestamp
-        body["submittedAt"] = datetime.now(timezone.utc).isoformat()
+        base_date = datetime.strptime(show_date, "%Y-%m-%d").date()
+        submitted_at = datetime.now(timezone.utc).isoformat()
 
-        # Send to SQS
-        response = sqs.send_message(
-            QueueUrl=QUEUE_URL,
-            MessageBody=json.dumps(body)
-        )
+        for day_offset in range(14):
+            date_obj = base_date + timedelta(days=day_offset)
+            message_body = {
+                "movieId": movie_id,
+                "movieTitle": movie_title,
+                "showDate": date_obj.strftime("%Y-%m-%d"),
+                "submittedAt": submitted_at
+            }
+
+            sqs.send_message(
+                QueueUrl=QUEUE_URL,
+                MessageBody=json.dumps(message_body)
+            )
 
         return {
             "statusCode": 202,
             "body": json.dumps({
                 "success": True,
-                "messageId": response["MessageId"]
+                "enqueued": 14
             })
         }
 
