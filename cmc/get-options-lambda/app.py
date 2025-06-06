@@ -32,23 +32,34 @@ def handler(event, context):
                 "body": json.dumps({"error": "No showtimes found in table"})
             }
 
-        item = items[0]
-        theaters = item.get("theaters", [])
+        all_results = []
 
-        # Optional theater filter
-        if filter_theater:
-            theaters = [t for t in theaters if filter_theater.lower() in t["name"].lower()]
+        for item in items:
+            theaters = item.get("theaters", [])
 
-        # Optional date filter
-        if filter_date:
-            for theater in theaters:
-                for fmt in theater.get("formats", []):
-                    fmt["slots"] = [
-                        s for s in fmt.get("slots", [])
-                        if s.get("date") == filter_date
-                    ]
-                theater["formats"] = [f for f in theater["formats"] if f["slots"]]
-            theaters = [t for t in theaters if t["formats"]]
+            # Optional theater filter
+            if filter_theater:
+                theaters = [t for t in theaters if filter_theater.lower() in t["name"].lower()]
+
+            # Optional date filter
+            if filter_date:
+                for theater in theaters:
+                    for fmt in theater.get("formats", []):
+                        fmt["slots"] = [
+                            s for s in fmt.get("slots", [])
+                            if s.get("date") == filter_date
+                        ]
+                    theater["formats"] = [f for f in theater["formats"] if f["slots"]]
+                theaters = [t for t in theaters if t["formats"]]
+
+            # Only include results with theaters after filtering
+            if theaters:
+                all_results.append({
+                    "movieId": item["movieId"],
+                    "movieTitle": item["movieTitle"],
+                    "showDate": item["showDate"],
+                    "theaters": theaters
+                })
 
         return {
             "statusCode": 200,
