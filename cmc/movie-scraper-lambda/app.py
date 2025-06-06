@@ -116,43 +116,33 @@ def fetch_amc_showtimes_by_movie(movie_title: str, start_date: str) -> list:
 
 
 def handler(event, context):
-    try:
-        body = json.loads(event.get("body", "{}"))
-        movie_id = body.get("movieId")
-        movie_title = body.get("movieTitle")
-        show_date = body.get("showDate")
+    for record in event.get("Records", []):
+        try:
+            body = json.loads(record["body"])
+            movie_id = body.get("movieId")
+            movie_title = body.get("movieTitle")
+            show_date = body.get("showDate")
 
-        if not movie_id or not movie_title or not show_date:
-            return {
-                "statusCode": 400,
-                "body": json.dumps({
-                    "error": "Missing one or more required fields: movieId, movieTitle, showDate"
-                })
+            if not movie_id or not movie_title or not show_date:
+                print(f"[SKIP] Invalid message: {body}")
+                continue
+
+            showtimes = fetch_amc_showtimes_by_movie(movie_title, show_date)
+
+            item = {
+                "movieId": movie_id,
+                "showDate": show_date,
+                "movieTitle": movie_title,
+                "createdAt": datetime.now(timezone.utc).isoformat(),
+                "theaters": showtimes
             }
 
-        showtimes = fetch_amc_showtimes_by_movie(movie_title, show_date)
+            table.put_item(Item=item)
+            print(f"[SUCCESS] Stored movieId={movie_id} showDate={show_date}")
 
-        item = {
-            "movieId": movie_id,
-            "showDate": show_date,
-            "movieTitle": movie_title,
-            "createdAt": datetime.now(timezone.utc).isoformat(),
-            "theaters": showtimes
-        }
+        except Exception as e:
+            print(f"[ERROR] Failed to process record: {e}")
 
-        # Store in DynamoDB
-        # table.put_item(Item=item)
-
-        return {
-            "statusCode": 200,
-            "body": json.dumps({"success": True, "stored": item})
-        }
-
-    except Exception as e:
-        return {
-            "statusCode": 500,
-            "body": json.dumps({"error": str(e)})
-        }
 
 # For local testing
 if __name__ == "__main__":
