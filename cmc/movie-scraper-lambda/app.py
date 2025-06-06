@@ -6,6 +6,7 @@ import requests
 from datetime import datetime, timezone
 from bs4 import BeautifulSoup
 from collections import defaultdict
+from difflib import get_close_matches
 
 # Initialize DynamoDB
 dynamodb = boto3.resource("dynamodb")
@@ -52,6 +53,11 @@ def fetch_amc_showtimes_for_day(movie_title: str, date_str: str) -> list:
             for section in sections:
                 aria_label = html.unescape(section["aria-label"].strip()).lower()
                 if f"showtimes for {normalized_title}" not in aria_label:
+                    continue
+                
+                title_in_label = aria_label.replace("showtimes for ", "").strip()
+                if not get_close_matches(normalized_title, [title_in_label], n=1, cutoff=0.7):
+                    print(f"[SKIP] No fuzzy match for {normalized_title} in: {aria_label}")
                     continue
 
                 format_blocks = section.find_all(["li", "div"], recursive=True)
@@ -120,6 +126,9 @@ def handler(event, context):
                 continue
 
             theaters = fetch_amc_showtimes_for_day(movie_title, show_date)
+            if not theaters:
+                print(f"[SKIP] No showtimes found for movieId={movie_id} on {show_date}")
+                continue
 
             item = {
                 "movieId": movie_id,
