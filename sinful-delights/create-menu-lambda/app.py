@@ -2,10 +2,9 @@ import json
 import os
 import boto3
 import uuid
-from datetime import datetime
 from botocore.exceptions import ClientError
 
-TABLE_NAME = os.environ.get("TABLE_NAME")
+TABLE_NAME = os.environ["TABLE_NAME"]
 dynamodb = boto3.client("dynamodb")
 
 def handler(event, context):
@@ -18,11 +17,15 @@ def handler(event, context):
             return _response(400, {"error": "menuId and items are required"})
 
         pk = f"MENU#{menu_id}"
-
         transact_items = []
 
+        created_ids = []
+
         for item in items:
+            # Use provided ID or generate a new one
             item_id = item.get("id") or str(uuid.uuid4())
+            created_ids.append(item_id)
+
             item_entry = {
                 "PK": {"S": pk},
                 "SK": {"S": f"ITEM#{item_id}"},
@@ -42,17 +45,22 @@ def handler(event, context):
                 "Put": {
                     "TableName": TABLE_NAME,
                     "Item": item_entry,
-                    "ConditionExpression": "attribute_not_exists(PK)"
+                    "ConditionExpression": "attribute_not_exists(PK) AND attribute_not_exists(SK)"
                 }
             })
 
+        # Perform the DB transaction
         dynamodb.transact_write_items(TransactItems=transact_items)
 
-        return _response(200, {"message": "Menu items added successfully"})
+        return _response(200, {
+            "message": "Menu items added successfully",
+            "itemIds": created_ids
+        })
 
     except ClientError as e:
+        # Likely a conditional check failure (duplicate)
         print("DynamoDB Error:", e.response["Error"])
-        return _response(500, {"error": e.response["Error"]["Message"]})
+        return _response(400, {"error": e.response["Error"]["Message"]})
     except Exception as e:
         print("Unhandled Exception:", str(e))
         return _response(500, {"error": str(e)})
