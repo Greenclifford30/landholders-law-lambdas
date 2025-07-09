@@ -1,30 +1,33 @@
 import boto3
 import json
-from boto3.dynamodb.conditions import Attr
+from boto3.dynamodb.conditions import Attr, Or
 
 dynamodb = boto3.resource('dynamodb')
 table = dynamodb.Table('Reunion_Attendees')
 
 def handler(event, context):
     try:
-        # Read search parameters from queryStringParameters (GET) or body (POST)
+        query = None
+
+        # Parse `q` from queryStringParameters
         if 'queryStringParameters' in event and event['queryStringParameters']:
-            params = event['queryStringParameters']
-        else:
-            params = json.loads(event.get('body', '{}'))
+            query = event['queryStringParameters'].get('q')
+        
+        if not query or query.strip() == '':
+            return {
+                "statusCode": 400,
+                "body": json.dumps({"error": "Missing search query parameter `q`"})
+            }
 
-        # Build filter expression
-        filter_expr = None
-        for key, value in params.items():
-            if value.strip() == '':
-                continue
-            condition = Attr(key).contains(value)
-            filter_expr = condition if filter_expr is None else filter_expr & condition
+        # Build a filter: match `q` in firstName, lastName, familyGroup, or registrationCode
+        filter_expr = (
+            Attr("firstName").contains(query) |
+            Attr("lastName").contains(query) |
+            Attr("familyGroup").contains(query) |
+            Attr("registrationCode").contains(query)
+        )
 
-        if filter_expr:
-            response = table.scan(FilterExpression=filter_expr)
-        else:
-            response = table.scan()  # no filters provided, return all
+        response = table.scan(FilterExpression=filter_expr)
 
         attendees = response.get('Items', [])
 
