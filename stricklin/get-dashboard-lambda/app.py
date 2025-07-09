@@ -26,12 +26,13 @@ def handler(event, context):
         dashboard_data = {
             "totalAttendees": total_attendees,
             "checkedIn": checked_in,
-            "shirtsPickedUp": shirts_picked_up
+            "shirtsPickedUp": shirts_picked_up,
+            "attendees": items
         }
 
         return {
             "statusCode": 200,
-            "body": json.dumps(dashboard_data)
+            "body": json.dumps(dashboard_data, default=str)  # in case there are Decimals or Dates
         }
 
     except Exception as e:
