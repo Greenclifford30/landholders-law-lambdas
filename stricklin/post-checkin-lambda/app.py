@@ -7,16 +7,19 @@ table = dynamodb.Table('Reunion_Attendees')
 
 def handler(event, context):
     try:
-        body = json.loads(event.get("body", "{}"))
-        attendee_id = body.get("id")
-        checkin = body.get("checkin", False)
-        pickup = body.get("shirtPickup", False)
+        # attendee id comes from pathParameters
+        attendee_id = event.get("pathParameters", {}).get("id")
 
         if not attendee_id:
             return {
                 "statusCode": 400,
-                "body": json.dumps({"error": "Missing attendee id"})
+                "body": json.dumps({"error": "Missing attendee id in path"})
             }
+
+        # actions still come from the JSON body
+        body = json.loads(event.get("body", "{}"))
+        checkin = body.get("checkin", False)
+        pickup = body.get("shirtPickup", False)
 
         update_expr = []
         expr_attrs = {}
@@ -24,12 +27,12 @@ def handler(event, context):
         if checkin:
             update_expr.append("checkedIn = :checkedIn, checkedInAt = :checkedInAt")
             expr_attrs[":checkedIn"] = True
-            expr_attrs[":checkedInAt"] = datetime.now().isoformat()
+            expr_attrs[":checkedInAt"] = datetime.utcnow().isoformat()
 
         if pickup:
             update_expr.append("shirtsPickedUp = :shirtsPickedUp, shirtsPickedUpAt = :shirtsPickedUpAt")
             expr_attrs[":shirtsPickedUp"] = True
-            expr_attrs[":shirtsPickedUpAt"] = datetime.now().isoformat()
+            expr_attrs[":shirtsPickedUpAt"] = datetime.utcnow().isoformat()
 
         if not update_expr:
             return {
