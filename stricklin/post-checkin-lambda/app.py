@@ -8,7 +8,7 @@ table = dynamodb.Table('Reunion_Attendees')
 def handler(event, context):
     try:
         # attendee id comes from pathParameters
-        attendee_id = event.get("pathParameters", {}).get("id")
+        attendee_id = event.get("pathParameters", {}).get("attendeeId")
 
         if not attendee_id:
             return {
