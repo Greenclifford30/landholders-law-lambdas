@@ -51,6 +51,10 @@ def handler(event, context):
 
         return {
             "statusCode": 200,
+            "headers": {
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Credentials": "true"
+            },
             "body": json.dumps({
                 "message": "Attendee updated",
                 "attendee": response.get("Attributes", {})
@@ -60,5 +64,9 @@ def handler(event, context):
     except Exception as e:
         return {
             "statusCode": 500,
+            "headers": {
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Credentials": "true"
+            },
             "body": json.dumps({"error": str(e)})
         }

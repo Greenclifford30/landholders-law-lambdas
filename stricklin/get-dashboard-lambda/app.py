@@ -1,9 +1,9 @@
 import boto3
 import json
-from decimal import Decimal
 
 dynamodb = boto3.resource('dynamodb')
 table = dynamodb.Table('Reunion_Attendees')
+
 
 def handler(event, context):
     try:
@@ -32,11 +32,19 @@ def handler(event, context):
 
         return {
             "statusCode": 200,
-            "body": json.dumps(dashboard_data, default=str)  # in case there are Decimals or Dates
+            "headers": {
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Credentials": "true"
+            },
+            "body": json.dumps(dashboard_data, default=str)
         }
 
     except Exception as e:
         return {
             "statusCode": 500,
+            "headers": {
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Credentials": "true"
+            },
             "body": json.dumps({"error": str(e)})
         }
