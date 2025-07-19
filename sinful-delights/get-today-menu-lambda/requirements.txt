@@ -1,0 +1,8 @@
+# This file lists Python dependencies for the "notify_owner" Lambda.
+
+# You can pin specific versions or allow flexible versions. 
+# The default Lambda environment includes boto3, but if you 
+# need local dev parity or a certain version, include it here.
+
+# If you plan to write unit tests, you may also add:
+# pytest~=7.2
