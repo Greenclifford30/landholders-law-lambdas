@@ -83,8 +83,8 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             
             # Prepare menu item for DynamoDB
             menu_item_entry = {
-                'PK': {'S': f'MENU#{menu_id}'},
-                'SK': {'S': f'ITEM#{item_id}'},
+                'menuId': {'S': f'MENU#{menu_id}'},
+                'itemId': {'S': f'ITEM#{item_id}'},
                 'id': {'S': item_id},
                 'name': {'S': item['name']},
                 'description': {'S': item.get('description', '')},
