@@ -99,10 +99,23 @@ jobs:
 
           echo "Deploying to Lambda: $FUNCTION_NAME"
 
-          # Update function code
-          aws lambda update-function-code \
-            --function-name "$FUNCTION_NAME" \
-            --zip-file fileb://${{ matrix.folder }}/lambda.zip
+          # Update function code with retry logic
+          echo "Updating function code..."
+          for i in {1..3}; do
+            if aws lambda update-function-code \
+              --function-name "$FUNCTION_NAME" \
+              --zip-file fileb://${{ matrix.folder }}/lambda.zip; then
+              echo "✓ Function code updated successfully"
+              break
+            else
+              echo "⚠️  Attempt $i failed, waiting 30 seconds..."
+              sleep 30
+            fi
+          done
+
+          # Wait for function update to complete before layer update
+          echo "Waiting for function to be ready..."
+          aws lambda wait function-updated --function-name "$FUNCTION_NAME"
 
           # Update layers for sinful-delights functions
           if [ "$PROJECT" = "sinful-delights" ]; then
@@ -119,12 +132,19 @@ jobs:
             
             LAYER_ARN="arn:aws:lambda:us-east-1:$AWS_ACCOUNT_ID:layer:sinful-delights-shared-layer:$LAYER_VERSION"
             
-            aws lambda update-function-configuration \
-              --function-name "$FUNCTION_NAME" \
-              --layers "$LAYER_ARN" \
-              --environment Variables="{PYTHONPATH=/opt/python}"
-              
-            echo "✓ Updated function to use shared layer version $LAYER_VERSION"
+            # Retry layer configuration update
+            for i in {1..3}; do
+              if aws lambda update-function-configuration \
+                --function-name "$FUNCTION_NAME" \
+                --layers "$LAYER_ARN" \
+                --environment Variables="{PYTHONPATH=/opt/python}"; then
+                echo "✓ Updated function to use shared layer version $LAYER_VERSION"
+                break
+              else
+                echo "⚠️  Layer update attempt $i failed, waiting 30 seconds..."
+                sleep 30
+              fi
+            done
           else
             echo "Skipping layer update for non-sinful-delights function"
           fi
