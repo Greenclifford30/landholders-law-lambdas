@@ -107,7 +107,17 @@ jobs:
           # Update layers for sinful-delights functions
           if [ "$PROJECT" = "sinful-delights" ]; then
             echo "Updating Lambda layers for sinful-delights function..."
-            LAYER_ARN="arn:aws:lambda:us-east-1:${{ secrets.AWS_ACCOUNT_ID }}:layer:sinful-delights-shared-layer:$LAYER_VERSION"
+            
+            # Get AWS Account ID dynamically if secret not available
+            if [ -z "${{ secrets.AWS_ACCOUNT_ID }}" ]; then
+              AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+              echo "Retrieved AWS Account ID: $AWS_ACCOUNT_ID"
+            else
+              AWS_ACCOUNT_ID="${{ secrets.AWS_ACCOUNT_ID }}"
+              echo "Using AWS Account ID from secret: $AWS_ACCOUNT_ID"
+            fi
+            
+            LAYER_ARN="arn:aws:lambda:us-east-1:$AWS_ACCOUNT_ID:layer:sinful-delights-shared-layer:$LAYER_VERSION"
             
             aws lambda update-function-configuration \
               --function-name "$FUNCTION_NAME" \
