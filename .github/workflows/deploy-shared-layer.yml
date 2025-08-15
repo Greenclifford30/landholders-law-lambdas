@@ -93,4 +93,6 @@ jobs:
           
           if [[ -n $(git status --porcelain) ]]; then
             git add sinful-delights/.layer-version
-            git commit -m "Update shared layer version to ${{ steps.deploy_layer.outputs.layer_version }}
+            git commit -m "Update shared layer version to ${{ steps.deploy_layer.outputs.layer_version }}"
+            git push origin main
+          fi
