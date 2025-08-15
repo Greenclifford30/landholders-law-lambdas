@@ -1,3 +1,6 @@
+"""
+GET /menu/{date} - Fetch menu by date (OpenAPI: getMenuByDate)
+"""
 import json
 import os
 import sys
@@ -11,10 +14,10 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'shared'))
 
 try:
     from shared.auth import validate_customer_access
-    from shared.errors import handle_exceptions, create_success_response, NotFoundError
+    from shared.errors import handle_exceptions, create_success_response, NotFoundError, ValidationError
     from shared.dynamo import query_items, parse_dynamodb_item
     from shared.models import Menu, MenuItem
-    from shared.utils import get_today_date
+    from shared.utils import validate_date_format, extract_path_params
 except ImportError:
     # Fallback for local testing
     import boto3
@@ -37,31 +40,48 @@ except ImportError:
     class NotFoundError(Exception):
         pass
     
-    def get_today_date():
-        return datetime.now().strftime("%Y-%m-%d")
+    class ValidationError(Exception):
+        pass
+    
+    def validate_date_format(date_str):
+        import re
+        return bool(re.match(r"^\d{4}-\d{2}-\d{2}$", date_str))
+    
+    def extract_path_params(event):
+        return event.get('pathParameters') or {}
 
 TABLE_NAME = os.environ.get("TABLE_NAME", "sinful-delights-table")
+
 
 @handle_exceptions
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     """
-    Fetch today's active menu for customers (OpenAPI: getTodayMenu).
+    Fetch menu for a specific date (OpenAPI: getMenuByDate).
     
-    Returns Menu object with today's active menu and items.
+    Path parameter: date (YYYY-MM-DD format)
+    Returns Menu object with menu and items for the specified date.
     """
     # Validate customer authentication
     validate_customer_access(event)
     
-    today = get_today_date()
+    # Extract and validate date parameter
+    path_params = extract_path_params(event)
+    date = path_params.get('date')
     
-    # Query for today's active menu
+    if not date:
+        raise ValidationError("Date parameter is required")
+    
+    if not validate_date_format(date):
+        raise ValidationError("Date must be in YYYY-MM-DD format", {"field": "date", "issue": "must match YYYY-MM-DD"})
+    
+    # Query for the specified date's menu
     try:
         from shared.dynamo import query_items, parse_dynamodb_item
         
-        menu_items = query_items(f"MENU#{today}", "ITEM#")
+        menu_items = query_items(f"MENU#{date}", "ITEM#")
         
         if not menu_items:
-            raise NotFoundError("No menu found for today")
+            raise NotFoundError(f"No menu found for date {date}")
         
         # Parse menu items
         items = []
@@ -92,8 +112,8 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         # Construct menu response according to OpenAPI spec
         menu_response = {
             'menuId': menu_data.get('menuId', str(uuid.uuid4())),
-            'date': today,
-            'title': menu_data.get('title', f"Menu for {today}"),
+            'date': date,
+            'title': menu_data.get('title', f"Menu for {date}"),
             'isActive': bool(menu_data.get('isActive', True)),
             'imageUrl': menu_data.get('imageUrl'),
             'lastUpdated': menu_data.get('lastUpdated'),
@@ -111,12 +131,12 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             TableName=TABLE_NAME,
             KeyConditionExpression="PK = :pk",
             ExpressionAttributeValues={
-                ":pk": {"S": f"MENU#{today}"}
+                ":pk": {"S": f"MENU#{date}"}
             }
         )
         
         if not response.get('Items'):
-            raise NotFoundError("No menu found for today")
+            raise NotFoundError(f"No menu found for date {date}")
         
         # Parse items (simplified for fallback)
         items = []
@@ -138,8 +158,8 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         
         menu_response = {
             'menuId': str(uuid.uuid4()),
-            'date': today,
-            'title': f"Menu for {today}",
+            'date': date,
+            'title': f"Menu for {date}",
             'isActive': True,
             'items': items
         }

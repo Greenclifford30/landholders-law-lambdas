@@ -1,8 +1,9 @@
+"""
+GET /menu/{menuId} - Fetch menu by ID (OpenAPI: getMenuById)
+"""
 import json
 import os
 import sys
-import uuid
-from datetime import datetime
 from typing import Dict, Any
 
 # Add shared modules to path
@@ -11,10 +12,10 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'shared'))
 
 try:
     from shared.auth import validate_customer_access
-    from shared.errors import handle_exceptions, create_success_response, NotFoundError
-    from shared.dynamo import query_items, parse_dynamodb_item
+    from shared.errors import handle_exceptions, create_success_response, NotFoundError, ValidationError
+    from shared.dynamo import get_item, query_items, parse_dynamodb_item
     from shared.models import Menu, MenuItem
-    from shared.utils import get_today_date
+    from shared.utils import extract_path_params
 except ImportError:
     # Fallback for local testing
     import boto3
@@ -37,41 +38,53 @@ except ImportError:
     class NotFoundError(Exception):
         pass
     
-    def get_today_date():
-        return datetime.now().strftime("%Y-%m-%d")
+    class ValidationError(Exception):
+        pass
+    
+    def extract_path_params(event):
+        return event.get('pathParameters') or {}
 
 TABLE_NAME = os.environ.get("TABLE_NAME", "sinful-delights-table")
+
 
 @handle_exceptions
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     """
-    Fetch today's active menu for customers (OpenAPI: getTodayMenu).
+    Fetch menu by ID (OpenAPI: getMenuById).
     
-    Returns Menu object with today's active menu and items.
+    Path parameter: menuId
+    Returns Menu object with menu and items for the specified menu ID.
     """
     # Validate customer authentication
     validate_customer_access(event)
     
-    today = get_today_date()
+    # Extract and validate menuId parameter
+    path_params = extract_path_params(event)
+    menu_id = path_params.get('menuId')
     
-    # Query for today's active menu
+    if not menu_id:
+        raise ValidationError("Menu ID parameter is required")
+    
+    # First try to get the menu metadata directly
     try:
-        from shared.dynamo import query_items, parse_dynamodb_item
+        from shared.dynamo import get_item, query_items, parse_dynamodb_item
         
-        menu_items = query_items(f"MENU#{today}", "ITEM#")
+        # Get menu details
+        menu_item = get_item(f"MENU#{menu_id}", "DETAILS")
         
-        if not menu_items:
-            raise NotFoundError("No menu found for today")
+        if not menu_item:
+            raise NotFoundError(f"Menu with ID {menu_id} not found")
+        
+        menu_data = parse_dynamodb_item(menu_item)
+        
+        # Query for all items in this menu
+        menu_items = query_items(f"MENU#{menu_id}", "ITEM#")
         
         # Parse menu items
         items = []
-        menu_data = None
-        
         for item in menu_items:
             parsed = parse_dynamodb_item(item)
-            
             if parsed.get('SK', '').startswith('ITEM#'):
-                # This is a menu item
                 items.append({
                     'itemId': parsed.get('itemId', ''),
                     'menuId': parsed.get('menuId', ''),
@@ -85,15 +98,12 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                     'spiceLevel': parsed.get('spiceLevel'),
                     'available': bool(parsed.get('available', True))
                 })
-            elif parsed.get('SK') == 'DETAILS':
-                # This is the menu metadata
-                menu_data = parsed
         
         # Construct menu response according to OpenAPI spec
         menu_response = {
-            'menuId': menu_data.get('menuId', str(uuid.uuid4())),
-            'date': today,
-            'title': menu_data.get('title', f"Menu for {today}"),
+            'menuId': menu_data.get('menuId', menu_id),
+            'date': menu_data.get('date', ''),
+            'title': menu_data.get('title', f"Menu {menu_id}"),
             'isActive': bool(menu_data.get('isActive', True)),
             'imageUrl': menu_data.get('imageUrl'),
             'lastUpdated': menu_data.get('lastUpdated'),
@@ -107,19 +117,22 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         import boto3
         dynamodb = boto3.client("dynamodb")
         
-        response = dynamodb.query(
+        # Try to find menu by scanning (not optimal but fallback)
+        response = dynamodb.scan(
             TableName=TABLE_NAME,
-            KeyConditionExpression="PK = :pk",
+            FilterExpression="contains(PK, :menu_id)",
             ExpressionAttributeValues={
-                ":pk": {"S": f"MENU#{today}"}
+                ":menu_id": {"S": menu_id}
             }
         )
         
         if not response.get('Items'):
-            raise NotFoundError("No menu found for today")
+            raise NotFoundError(f"Menu with ID {menu_id} not found")
         
         # Parse items (simplified for fallback)
         items = []
+        menu_data = None
+        
         for item in response.get('Items', []):
             if item.get('SK', {}).get('S', '').startswith('ITEM#'):
                 items.append({
@@ -135,12 +148,19 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                     'spiceLevel': item.get('spiceLevel', {}).get('N'),
                     'available': item.get('available', {}).get('BOOL', True)
                 })
+            elif item.get('SK', {}).get('S') == 'DETAILS':
+                menu_data = item
+        
+        if not menu_data:
+            raise NotFoundError(f"Menu with ID {menu_id} not found")
         
         menu_response = {
-            'menuId': str(uuid.uuid4()),
-            'date': today,
-            'title': f"Menu for {today}",
-            'isActive': True,
+            'menuId': menu_id,
+            'date': menu_data.get('date', {}).get('S', ''),
+            'title': menu_data.get('title', {}).get('S', f"Menu {menu_id}"),
+            'isActive': menu_data.get('isActive', {}).get('BOOL', True),
+            'imageUrl': menu_data.get('imageUrl', {}).get('S'),
+            'lastUpdated': menu_data.get('lastUpdated', {}).get('S'),
             'items': items
         }
         

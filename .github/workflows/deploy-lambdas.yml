@@ -5,6 +5,27 @@ on:
     branches: [ "main" ]
 
 jobs:
+  # First, ensure shared layer is deployed (for sinful-delights)
+  check-shared-layer:
+    name: Check Shared Layer Status
+    runs-on: ubuntu-latest
+    outputs:
+      layer-version: ${{ steps.get_layer.outputs.version }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v3
+
+      - name: Get current layer version
+        id: get_layer
+        run: |
+          if [ -f "sinful-delights/.layer-version" ]; then
+            LAYER_VERSION=$(grep "SINFUL_DELIGHTS_SHARED_LAYER_VERSION=" sinful-delights/.layer-version | cut -d'=' -f2)
+            echo "version=$LAYER_VERSION" >> $GITHUB_OUTPUT
+            echo "Found shared layer version: $LAYER_VERSION"
+          else
+            echo "version=1" >> $GITHUB_OUTPUT
+            echo "No layer version file found, using version 1"
+          fi
   discover-lambdas:
     name: Discover Lambda Folders
     runs-on: ubuntu-latest
@@ -34,7 +55,7 @@ jobs:
   build-and-deploy:
     name: Build and Deploy Each Lambda
     runs-on: ubuntu-latest
-    needs: [ discover-lambdas ]
+    needs: [ discover-lambdas, check-shared-layer ]
     environment: main
     strategy:
       fail-fast: false
@@ -57,8 +78,8 @@ jobs:
       - name: Build Lambda (if changed)
         if: steps.check_changes.outputs.changed == 'true'
         run: |
-          chmod +x build-lambda.sh
-          ./build-lambda.sh ${{ matrix.folder }}
+          chmod +x build-lambda-with-layer.sh
+          ./build-lambda-with-layer.sh ${{ matrix.folder }}
 
       - name: Configure AWS Credentials (if changed)
         if: steps.check_changes.outputs.changed == 'true'
@@ -74,9 +95,26 @@ jobs:
           PROJECT=$(echo "${{ matrix.folder }}" | cut -d'/' -f1)
           LAMBDA_FOLDER=$(echo "${{ matrix.folder }}" | cut -d'/' -f2)
           FUNCTION_NAME="${PROJECT}-${LAMBDA_FOLDER}"
+          LAYER_VERSION="${{ needs.check-shared-layer.outputs.layer-version }}"
 
           echo "Deploying to Lambda: $FUNCTION_NAME"
 
+          # Update function code
           aws lambda update-function-code \
             --function-name "$FUNCTION_NAME" \
             --zip-file fileb://${{ matrix.folder }}/lambda.zip
+
+          # Update layers for sinful-delights functions
+          if [ "$PROJECT" = "sinful-delights" ]; then
+            echo "Updating Lambda layers for sinful-delights function..."
+            LAYER_ARN="arn:aws:lambda:us-east-1:${{ secrets.AWS_ACCOUNT_ID }}:layer:sinful-delights-shared-layer:$LAYER_VERSION"
+            
+            aws lambda update-function-configuration \
+              --function-name "$FUNCTION_NAME" \
+              --layers "$LAYER_ARN" \
+              --environment Variables="{PYTHONPATH=/opt/python}"
+              
+            echo "✓ Updated function to use shared layer version $LAYER_VERSION"
+          else
+            echo "Skipping layer update for non-sinful-delights function"
+          fi

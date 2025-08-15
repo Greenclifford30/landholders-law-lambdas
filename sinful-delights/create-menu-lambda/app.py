@@ -1,43 +1,58 @@
 import json
 import os
-import boto3
-import uuid
+import sys
 from datetime import datetime, timedelta
 from typing import Dict, Any, List
-from botocore.exceptions import ClientError
 
-# DynamoDB configuration
-TABLE_NAME = os.environ["TABLE_NAME"]
-dynamodb = boto3.client("dynamodb")
+# Add shared modules to path
+sys.path.append('/opt/python')
+sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'shared'))
 
-def validate_api_key(event: Dict[str, Any]) -> bool:
-    """
-    Validate the API key from the event headers.
+try:
+    from shared.auth import validate_admin_access, validate_customer_access, get_user_id
+    from shared.errors import handle_exceptions, create_success_response, ValidationError, NotFoundError, OutOfStockError
+    from shared.dynamo import get_item, put_item, update_item, delete_item, query_items, transact_write, parse_dynamodb_item, format_dynamodb_item
+    from shared.models import MenuItem, Menu, Order, CreateOrderRequest, Subscription, UpsertSubscriptionRequest, CateringRequestCreate, AdminAnalytics, MenuUpsert, InventoryAdjustRequest, InventoryAdjustResponse
+    from shared.utils import generate_id, validate_iso8601_datetime, get_today_date
+    from shared.s3 import generate_presigned_upload_url
+except ImportError:
+    # Fallback for local testing
+    import boto3
+    from botocore.exceptions import ClientError
     
-    Args:
-        event (Dict[str, Any]): Lambda event dictionary
+    # DynamoDB configuration
+    TABLE_NAME = os.environ["TABLE_NAME"]
+    dynamodb = boto3.client("dynamodb")
     
-    Returns:
-        bool: True if API key is valid, False otherwise
-    """
-    # Check for 'X-API-Key' in event headers
-    return 'X-API-Key' in event.get('headers', {})
+    def validate_admin_access(event):
+        return 'X-API-Key' in event.get('headers', {}) and 'Authorization' in event.get('headers', {})
+    
+    def validate_customer_access(event):
+        return 'X-API-Key' in event.get('headers', {}) and 'Authorization' in event.get('headers', {})
+    
+    def get_user_id(event):
+        return event['requestContext']['authorizer']['claims']['sub']
+    
+    def handle_exceptions(func):
+        def wrapper(event, context):
+            try:
+                return func(event, context)
+            except Exception as e:
+                return _response(500, {'error': {'code': 'INTERNAL', 'message': str(e)}})
+        return wrapper
+    
+    def create_success_response(data, status_code=200):
+        return _response(status_code, data)
+    
+    def generate_id():
+        return str(uuid.uuid4())
+    
+    def get_today_date():
+        return datetime.now().strftime("%Y-%m-%d")
+    
+    import uuid
 
-def validate_auth_token(event: Dict[str, Any], admin: bool = False) -> bool:
-    """
-    Validate Firebase Auth ID token.
-    
-    Args:
-        event (Dict[str, Any]): Lambda event dictionary
-        admin (bool, optional): Whether to check for admin privileges. Defaults to False.
-    
-    Returns:
-        bool: True if token is valid, False otherwise
-    """
-    # Validate Firebase Auth token 
-    # For admin endpoints, additional admin role check would be implemented here
-    return 'Authorization' in event.get('headers', {})
-
+@handle_exceptions
 def get_today_menu(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     """
     Fetch today's active menu for customers.
@@ -49,35 +64,27 @@ def get_today_menu(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     Returns:
         Dict[str, Any]: HTTP response with menu items
     """
-    if not validate_api_key(event) or not validate_auth_token(event):
-        return _response(401, {'error': 'Unauthorized'})
+    validate_customer_access(event)
     
-    try:
-        # Query DynamoDB for today's menu items
-        today = datetime.now().strftime("%Y-%m-%d")
-        response = dynamodb.query(
-            TableName=TABLE_NAME,
-            IndexName="DateIndex",
-            KeyConditionExpression="MenuDate = :date",
-            ExpressionAttributeValues={":date": {"S": today}}
-        )
-        
-        menu_items = []
-        for item in response.get('Items', []):
-            menu_items.append({
-                'itemId': item.get('id', {}).get('S', ''),
-                'name': item.get('name', {}).get('S', ''),
-                'description': item.get('description', {}).get('S', ''),
-                'price': float(item.get('price', {}).get('N', 0)),
-                'stockQty': int(item.get('stockQty', {}).get('N', 0)),
-                'isSpecial': item.get('isSpecial', {}).get('BOOL', False),
-                'imageUrl': item.get('imageUrl', {}).get('S', '')
-            })
-        
-        return _response(200, menu_items)
-    except ClientError as e:
-        return _response(500, {'error': str(e)})
+    today = get_today_date()
+    menu_items = query_items(f"MENU#{today}", "ITEM#")
+    
+    parsed_items = []
+    for item in menu_items:
+        parsed_item = parse_dynamodb_item(item)
+        parsed_items.append({
+            'itemId': parsed_item.get('itemId', ''),
+            'name': parsed_item.get('name', ''),
+            'description': parsed_item.get('description', ''),
+            'price': parsed_item.get('price', 0),
+            'stockQty': parsed_item.get('stockQty', 0),
+            'isSpecial': parsed_item.get('isSpecial', False),
+            'imageUrl': parsed_item.get('imageUrl', '')
+        })
+    
+    return create_success_response(parsed_items)
 
+@handle_exceptions
 def create_order(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     """
     Create a customer order with stock validation and decrementing.
@@ -89,65 +96,58 @@ def create_order(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     Returns:
         Dict[str, Any]: HTTP response with order confirmation
     """
-    if not validate_api_key(event) or not validate_auth_token(event):
-        return _response(401, {'error': 'Unauthorized'})
+    validate_customer_access(event)
+    user_id = get_user_id(event)
     
-    try:
-        body = json.loads(event.get('body', '{}'))
-        items = body.get('items', [])
-        pickup_slot = body.get('pickupSlot')
-        
-        if not items or not pickup_slot:
-            return _response(400, {'error': 'Invalid order details'})
-        
-        # Create transactional write items to update stock and create order
-        transact_items = []
-        order_id = str(uuid.uuid4())
-        
-        for item in items:
-            # Validate and decrement stock atomically
-            transact_items.append({
-                'Update': {
-                    'TableName': TABLE_NAME,
-                    'Key': {
-                        'PK': {'S': f'ITEM#{item["itemId"]}'},
-                        'SK': {'S': f'STOCK'}
-                    },
-                    'UpdateExpression': 'SET StockQty = StockQty - :qty',
-                    'ConditionExpression': 'StockQty >= :qty',
-                    'ExpressionAttributeValues': {
-                        ':qty': {'N': str(item['qty'])}
-                    }
-                }
-            })
-        
-        # Add order record
+    body = json.loads(event.get('body', '{}'))
+    order_request = CreateOrderRequest(**body)
+    
+    order_id = generate_id()
+    
+    # Create transactional write items to update stock and create order
+    transact_items = []
+    
+    for item in order_request.items:
+        # Validate and decrement stock atomically
         transact_items.append({
-            'Put': {
-                'TableName': TABLE_NAME,
-                'Item': {
-                    'PK': {'S': f'ORDER#{order_id}'},
-                    'SK': {'S': 'DETAILS'},
-                    'OrderId': {'S': order_id},
-                    'PickupSlot': {'S': pickup_slot},
-                    'Status': {'S': 'confirmed'}
-                }
+            'Update': {
+                'Key': f'ITEM#{item["itemId"]}',
+                'SK': 'STOCK',
+                'UpdateExpression': 'SET stockQty = stockQty - :qty',
+                'ConditionExpression': 'stockQty >= :qty',
+                'ExpressionAttributeValues': {':qty': item['quantity']}
             }
         })
-        
-        # Perform atomic transaction
-        dynamodb.transact_write_items(TransactItems=transact_items)
-        
-        return _response(201, {
-            'orderId': order_id,
-            'status': 'confirmed',
-            'pickupSlot': pickup_slot
-        })
-    except ClientError as e:
-        return _response(400, {'error': 'Stock unavailable or order creation failed'})
-    except Exception as e:
-        return _response(500, {'error': str(e)})
+    
+    # Add order record
+    transact_items.append({
+        'Put': {
+            'Key': f'ORDER#{order_id}',
+            'SK': 'DETAILS',
+            'Item': {
+                'orderId': order_id,
+                'userId': user_id,
+                'pickupSlot': order_request.pickupSlot.isoformat(),
+                'status': 'NEW',
+                'placedAt': datetime.now().isoformat(),
+                'notes': order_request.notes
+            }
+        }
+    })
+    
+    # Perform atomic transaction
+    try:
+        transact_write(transact_items)
+    except Exception:
+        raise OutOfStockError("Stock unavailable for one or more items")
+    
+    return create_success_response({
+        'orderId': order_id,
+        'status': 'NEW',
+        'pickupSlot': order_request.pickupSlot.isoformat()
+    }, 201)
 
+@handle_exceptions
 def get_subscription(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     """
     Retrieve customer's subscription details.
@@ -159,34 +159,17 @@ def get_subscription(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     Returns:
         Dict[str, Any]: HTTP response with subscription details
     """
-    if not validate_api_key(event) or not validate_auth_token(event):
-        return _response(401, {'error': 'Unauthorized'})
+    validate_customer_access(event)
+    user_id = get_user_id(event)
     
-    try:
-        # Retrieve user ID from token
-        user_id = event['requestContext']['authorizer']['claims']['sub']
-        
-        # Query DynamoDB for user's subscription
-        response = dynamodb.get_item(
-            TableName=TABLE_NAME,
-            Key={
-                'PK': {'S': f'USER#{user_id}'},
-                'SK': {'S': 'SUBSCRIPTION'}
-            }
-        )
-        
-        item = response.get('Item', {})
-        subscription = {
-            'subscriptionId': item.get('SubscriptionId', {}).get('S', ''),
-            'plan': item.get('Plan', {}).get('S', ''),
-            'status': item.get('Status', {}).get('S', ''),
-            'nextDelivery': item.get('NextDelivery', {}).get('S', '')
-        }
-        
-        return _response(200, subscription)
-    except ClientError as e:
-        return _response(500, {'error': str(e)})
+    subscription_item = get_item(f'USER#{user_id}', 'SUBSCRIPTION')
+    if not subscription_item:
+        raise NotFoundError("Subscription not found")
+    
+    subscription_data = parse_dynamodb_item(subscription_item)
+    return create_success_response(subscription_data)
 
+@handle_exceptions
 def create_subscription(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     """
     Create or update customer subscription.
@@ -198,41 +181,31 @@ def create_subscription(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     Returns:
         Dict[str, Any]: HTTP response with updated subscription details
     """
-    if not validate_api_key(event) or not validate_auth_token(event):
-        return _response(401, {'error': 'Unauthorized'})
+    validate_customer_access(event)
+    user_id = get_user_id(event)
     
-    try:
-        body = json.loads(event.get('body', '{}'))
-        user_id = event['requestContext']['authorizer']['claims']['sub']
-        
-        subscription_id = str(uuid.uuid4())
-        next_delivery = (datetime.now() + timedelta(days=7)).isoformat()
-        
-        dynamodb.put_item(
-            TableName=TABLE_NAME,
-            Item={
-                'PK': {'S': f'USER#{user_id}'},
-                'SK': {'S': 'SUBSCRIPTION'},
-                'SubscriptionId': {'S': subscription_id},
-                'Plan': {'S': body['plan']},
-                'PortionSize': {'S': body['portionSize']},
-                'MealsPerWeek': {'N': str(body['mealsPerWeek'])},
-                'Status': {'S': 'Active'},
-                'NextDelivery': {'S': next_delivery}
-            }
-        )
-        
-        return _response(201, {
-            'subscriptionId': subscription_id,
-            'plan': body['plan'],
-            'portionSize': body['portionSize'],
-            'mealsPerWeek': body['mealsPerWeek'],
-            'status': 'Active',
-            'nextDelivery': next_delivery
-        })
-    except Exception as e:
-        return _response(500, {'error': str(e)})
+    body = json.loads(event.get('body', '{}'))
+    subscription_request = UpsertSubscriptionRequest(**body)
+    
+    subscription_id = generate_id()
+    next_delivery = (datetime.now() + timedelta(days=7)).strftime("%Y-%m-%d")
+    
+    subscription_data = {
+        'subscriptionId': subscription_id,
+        'userId': user_id,
+        'plan': subscription_request.plan.dict() if subscription_request.plan else {},
+        'nextDelivery': next_delivery,
+        'status': 'ACTIVE',
+        'skipDates': subscription_request.skipDates or [],
+        'createdAt': datetime.now().isoformat(),
+        'updatedAt': datetime.now().isoformat()
+    }
+    
+    put_item(f'USER#{user_id}', 'SUBSCRIPTION', subscription_data)
+    
+    return create_success_response(subscription_data, 201)
 
+@handle_exceptions
 def create_catering_request(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     """
     Save a catering request.
@@ -244,35 +217,33 @@ def create_catering_request(event: Dict[str, Any], context: Any) -> Dict[str, An
     Returns:
         Dict[str, Any]: HTTP response with catering request details
     """
-    if not validate_api_key(event) or not validate_auth_token(event):
-        return _response(401, {'error': 'Unauthorized'})
+    validate_customer_access(event)
+    user_id = get_user_id(event)
     
-    try:
-        body = json.loads(event.get('body', '{}'))
-        user_id = event['requestContext']['authorizer']['claims']['sub']
-        request_id = str(uuid.uuid4())
-        
-        dynamodb.put_item(
-            TableName=TABLE_NAME,
-            Item={
-                'PK': {'S': f'USER#{user_id}'},
-                'SK': {'S': f'CATERING#{request_id}'},
-                'RequestId': {'S': request_id},
-                'EventDate': {'S': body['eventDate']},
-                'GuestCount': {'N': str(body['guestCount'])},
-                'CuisinePreferences': {'S': body['cuisinePreferences']},
-                'Budget': {'N': str(body['budget'])},
-                'Status': {'S': 'New'}
-            }
-        )
-        
-        return _response(201, {
-            'requestId': request_id,
-            'status': 'New'
-        })
-    except Exception as e:
-        return _response(500, {'error': str(e)})
+    body = json.loads(event.get('body', '{}'))
+    catering_request = CateringRequestCreate(**body)
+    
+    request_id = generate_id()
+    
+    catering_data = {
+        'requestId': request_id,
+        'userId': user_id,
+        'eventDate': catering_request.eventDate,
+        'guestCount': catering_request.guestCount,
+        'status': 'NEW',
+        'createdAt': datetime.now().isoformat(),
+        'budget': catering_request.budget,
+        'contact': catering_request.contact.dict()
+    }
+    
+    put_item(f'USER#{user_id}', f'CATERING#{request_id}', catering_data)
+    
+    return create_success_response({
+        'requestId': request_id,
+        'status': 'NEW'
+    }, 201)
 
+@handle_exceptions
 def get_admin_analytics(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     """
     Retrieve admin dashboard metrics.
@@ -284,32 +255,31 @@ def get_admin_analytics(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     Returns:
         Dict[str, Any]: HTTP response with analytics
     """
-    if not validate_api_key(event) or not validate_auth_token(event, admin=True):
-        return _response(401, {'error': 'Unauthorized'})
+    validate_admin_access(event)
     
-    try:
-        # Scan for analytics data
-        # This would be optimized in a real-world scenario with a dedicated analytics table/view
-        sales_response = dynamodb.scan(
-            TableName=TABLE_NAME,
-            FilterExpression='begins_with(PK, :order)',
-            ExpressionAttributeValues={':order': {'S': 'ORDER#'}}
-        )
-        
-        analytics = {
-            'totalSales': sum(float(item.get('Total', {}).get('N', 0)) for item in sales_response.get('Items', [])),
-            'topItems': [
-                {'name': 'Chocolate Lava Cake', 'sales': 342},
-                {'name': 'Tiramisu', 'sales': 287}
-            ],
-            'customerChurn': 0.05,
-            'averageOrderValue': sum(float(item.get('Total', {}).get('N', 0)) for item in sales_response.get('Items', [])) / max(len(sales_response.get('Items', [])), 1)
+    # Query for orders and calculate analytics
+    orders = query_items("ORDER", "DETAILS", limit=1000)
+    
+    total_sales = sum(order.get('total', 0) for order in orders)
+    order_count = len(orders)
+    
+    analytics = {
+        'dailyGrossSales': total_sales,
+        'topItems': [
+            {'name': 'Chocolate Lava Cake', 'sales': 342},
+            {'name': 'Tiramisu', 'sales': 287}
+        ],
+        'subscriptionChurn': 0.05,
+        'cateringPipeline': {
+            'NEW': 5,
+            'QUOTED': 3,
+            'SCHEDULED': 2
         }
-        
-        return _response(200, analytics)
-    except Exception as e:
-        return _response(500, {'error': str(e)})
+    }
+    
+    return create_success_response(analytics)
 
+@handle_exceptions
 def create_admin_menu(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     """
     Create or update menu for a specific date.
@@ -321,45 +291,58 @@ def create_admin_menu(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     Returns:
         Dict[str, Any]: HTTP response with menu update status
     """
-    if not validate_api_key(event) or not validate_auth_token(event, admin=True):
-        return _response(401, {'error': 'Unauthorized'})
+    validate_admin_access(event)
     
-    try:
-        body = json.loads(event.get('body', '{}'))
-        menu_date = body.get('date')
-        menu_items = body.get('items', [])
-        menu_id = str(uuid.uuid4())
-        
-        transact_items = []
-        for item in menu_items:
-            item_id = str(uuid.uuid4())
-            transact_items.append({
-                'Put': {
-                    'TableName': TABLE_NAME,
-                    'Item': {
-                        'PK': {'S': f'MENU#{menu_id}'},
-                        'SK': {'S': f'ITEM#{item_id}'},
-                        'id': {'S': item_id},
-                        'name': {'S': item['name']},
-                        'description': {'S': item.get('description', '')},
-                        'price': {'N': str(item['price'])},
-                        'stockQty': {'N': str(item.get('stockQty', 0))},
-                        'isSpecial': {'BOOL': item.get('isSpecial', False)},
-                        'imageUrl': {'S': item.get('imageUrl', '')},
-                        'MenuDate': {'S': menu_date}
-                    }
-                }
-            })
-        
-        dynamodb.transact_write_items(TransactItems=transact_items)
-        
-        return _response(201, {
+    body = json.loads(event.get('body', '{}'))
+    menu_request = MenuUpsert(**body)
+    
+    menu_id = menu_request.menuId or generate_id()
+    
+    # Create menu record
+    menu_data = {
+        'menuId': menu_id,
+        'date': menu_request.date,
+        'title': menu_request.title,
+        'isActive': menu_request.isActive,
+        'imageUrl': menu_request.imageUrl,
+        'lastUpdated': datetime.now().isoformat()
+    }
+    
+    put_item(f'MENU#{menu_id}', 'DETAILS', menu_data)
+    
+    # Create item records
+    transact_items = []
+    for item in menu_request.items:
+        item_data = {
+            'itemId': item.itemId,
             'menuId': menu_id,
-            'status': 'updated'
+            'name': item.name,
+            'price': item.price,
+            'stockQty': item.stockQty,
+            'isSpecial': item.isSpecial,
+            'available': item.available,
+            'description': item.description,
+            'imageUrl': item.imageUrl,
+            'category': item.category.value if item.category else None,
+            'spiceLevel': item.spiceLevel
+        }
+        
+        transact_items.append({
+            'Put': {
+                'Key': f'MENU#{menu_id}',
+                'SK': f'ITEM#{item.itemId}',
+                'Item': item_data
+            }
         })
-    except Exception as e:
-        return _response(500, {'error': str(e)})
+    
+    transact_write(transact_items)
+    
+    return create_success_response({
+        'menuId': menu_id,
+        'status': 'created'
+    }, 201)
 
+@handle_exceptions
 def update_inventory(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     """
     Adjust stock quantity of a menu item.
@@ -371,34 +354,33 @@ def update_inventory(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     Returns:
         Dict[str, Any]: HTTP response with updated stock quantity
     """
-    if not validate_api_key(event) or not validate_auth_token(event, admin=True):
-        return _response(401, {'error': 'Unauthorized'})
+    validate_admin_access(event)
     
-    try:
-        body = json.loads(event.get('body', '{}'))
-        item_id = body.get('itemId')
-        adjustment = body.get('adjustment')
-        
-        response = dynamodb.update_item(
-            TableName=TABLE_NAME,
-            Key={
-                'PK': {'S': f'ITEM#{item_id}'},
-                'SK': {'S': 'STOCK'}
-            },
-            UpdateExpression='SET StockQty = StockQty + :adj',
-            ExpressionAttributeValues={':adj': {'N': str(adjustment)}},
-            ReturnValues='UPDATED_NEW'
-        )
-        
-        new_stock_qty = int(response.get('Attributes', {}).get('StockQty', {}).get('N', 0))
-        
-        return _response(200, {
-            'itemId': item_id,
-            'newStockQty': new_stock_qty
-        })
-    except Exception as e:
-        return _response(500, {'error': str(e)})
+    body = json.loads(event.get('body', '{}'))
+    inventory_request = InventoryAdjustRequest(**body)
+    
+    # Update stock atomically with condition to prevent negative stock
+    updated_item = update_item(
+        f'ITEM#{inventory_request.itemId}',
+        'STOCK',
+        'SET stockQty = stockQty + :adj',
+        {':adj': inventory_request.adjustment},
+        condition_expression='stockQty + :adj >= :zero',
+        expression_attribute_values={':zero': 0},
+        return_values='ALL_NEW'
+    )
+    
+    if not updated_item:
+        raise ValidationError("Stock adjustment would result in negative inventory")
+    
+    parsed_item = parse_dynamodb_item(updated_item)
+    
+    return create_success_response({
+        'itemId': inventory_request.itemId,
+        'newStockQty': parsed_item.get('stockQty', 0)
+    })
 
+@handle_exceptions  
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     """
     Route Lambda requests to appropriate handlers based on resource and HTTP method.
@@ -434,18 +416,11 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         return update_inventory(event, context)
     
     # Unsupported route
-    return _response(404, {'error': 'Not Found'})
+    raise NotFoundError("Endpoint not found")
 
 def _response(status_code: int, body: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Standardized response formatter for Lambda functions.
-    
-    Args:
-        status_code (int): HTTP status code
-        body (Dict[str, Any]): Response body
-    
-    Returns:
-        Dict[str, Any]: Formatted HTTP response
+    Fallback response formatter for local testing.
     """
     return {
         'statusCode': status_code,

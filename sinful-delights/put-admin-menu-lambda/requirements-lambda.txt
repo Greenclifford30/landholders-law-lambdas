@@ -1,0 +1,5 @@
+# Lambda-specific requirements for put-admin-menu-lambda
+# Common dependencies (boto3, pydantic, python-jose, requests) provided by shared layer
+
+# This function only needs the shared layer dependencies
+# No additional lambda-specific dependencies required

@@ -1,21 +1,51 @@
+
 import json
 import os
-import boto3
-import uuid
+import sys
 from typing import Dict, Any
+from datetime import datetime
 
-# DynamoDB configuration
-TABLE_NAME = os.environ["TABLE_NAME"]
-dynamodb = boto3.client("dynamodb")
+# Add shared modules to path
+sys.path.append('/opt/python')
+sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'shared'))
 
-def validate_api_key(event: Dict[str, Any]) -> bool:
-    """Validate the API key from the event headers."""
-    return 'X-API-Key' in event.get('headers', {})
+try:
+    from shared.auth import validate_customer_access, get_user_id
+    from shared.errors import handle_exceptions, create_success_response, ValidationError
+    from shared.dynamo import put_item
+    from shared.models import CateringRequestCreate
+    from shared.utils import generate_id
+except ImportError:
+    # Fallback for local testing
+    import boto3
+    import uuid
+    from botocore.exceptions import ClientError
+    
+    # DynamoDB configuration
+    TABLE_NAME = os.environ["TABLE_NAME"]
+    dynamodb = boto3.client("dynamodb")
+    
+    def validate_customer_access(event):
+        return 'X-API-Key' in event.get('headers', {}) and 'Authorization' in event.get('headers', {})
+    
+    def get_user_id(event):
+        return event['requestContext']['authorizer']['claims']['sub']
+    
+    def handle_exceptions(func):
+        def wrapper(event, context):
+            try:
+                return func(event, context)
+            except Exception as e:
+                return _response(500, {'error': {'code': 'INTERNAL', 'message': str(e)}})
+        return wrapper
+    
+    def create_success_response(data, status_code=200):
+        return _response(status_code, data)
+    
+    def generate_id():
+        return str(uuid.uuid4())
 
-def validate_auth_token(event: Dict[str, Any]) -> bool:
-    """Validate Firebase Auth ID token."""
-    return 'Authorization' in event.get('headers', {})
-
+@handle_exceptions
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     """
     Save a catering request.
@@ -27,75 +57,42 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     Returns:
         Dict[str, Any]: HTTP response with catering request details
     """
-    # Validate API key and auth token
-    if not validate_api_key(event) or not validate_auth_token(event):
-        return {
-            'statusCode': 401,
-            'headers': {
-                'Content-Type': 'application/json',
-                'Access-Control-Allow-Origin': '*'
-            },
-            'body': json.dumps({'error': 'Unauthorized'})
-        }
+    validate_customer_access(event)
+    user_id = get_user_id(event)
     
-    try:
-        body = json.loads(event.get('body', '{}'))
-        user_id = event['requestContext']['authorizer']['claims']['sub']
-        
-        # Validate required fields
-        required_fields = ['eventDate', 'guestCount', 'cuisinePreferences', 'budget']
-        if not all(body.get(field) for field in required_fields):
-            return {
-                'statusCode': 400,
-                'headers': {
-                    'Content-Type': 'application/json',
-                    'Access-Control-Allow-Origin': '*'
-                },
-                'body': json.dumps({'error': 'Missing catering request details'})
-            }
-        
-        # Generate request ID
-        request_id = str(uuid.uuid4())
-        
-        # Prepare catering request item
-        catering_request_item = {
-            'PK': {'S': f'USER#{user_id}'},
-            'SK': {'S': f'CATERING#{request_id}'},
-            'RequestId': {'S': request_id},
-            'EventDate': {'S': body['eventDate']},
-            'GuestCount': {'N': str(body['guestCount'])},
-            'CuisinePreferences': {'S': body['cuisinePreferences']},
-            'Budget': {'N': str(body['budget'])},
-            'Status': {'S': 'New'}
-        }
-        
-        # Optional additional details
-        if body.get('additionalNotes'):
-            catering_request_item['AdditionalNotes'] = {'S': body['additionalNotes']}
-        
-        # Save to DynamoDB
-        dynamodb.put_item(
-            TableName=TABLE_NAME,
-            Item=catering_request_item
-        )
-        
-        return {
-            'statusCode': 201,
-            'headers': {
-                'Content-Type': 'application/json',
-                'Access-Control-Allow-Origin': '*'
-            },
-            'body': json.dumps({
-                'requestId': request_id,
-                'status': 'New'
-            })
-        }
-    except Exception as e:
-        return {
-            'statusCode': 500,
-            'headers': {
-                'Content-Type': 'application/json',
-                'Access-Control-Allow-Origin': '*'
-            },
-            'body': json.dumps({'error': str(e)})
-        }
+    body = json.loads(event.get('body', '{}'))
+    catering_request = CateringRequestCreate(**body)
+    
+    request_id = generate_id()
+    
+    catering_data = {
+        'requestId': request_id,
+        'userId': user_id,
+        'eventDate': catering_request.eventDate,
+        'guestCount': catering_request.guestCount,
+        'status': 'NEW',
+        'createdAt': datetime.now().isoformat(),
+        'budget': catering_request.budget,
+        'contact': catering_request.contact.dict()
+    }
+    
+    if catering_request.cuisinePreferences:
+        catering_data['cuisinePreferences'] = catering_request.cuisinePreferences
+    
+    put_item(f'USER#{user_id}', f'CATERING#{request_id}', catering_data)
+    
+    return create_success_response({
+        'requestId': request_id,
+        'status': 'NEW'
+    }, 201)
+
+def _response(status_code: int, body: Dict[str, Any]) -> Dict[str, Any]:
+    """Fallback response formatter for local testing."""
+    return {
+        'statusCode': status_code,
+        'headers': {
+            'Content-Type': 'application/json',
+            'Access-Control-Allow-Origin': '*'
+        },
+        'body': json.dumps(body)
+    }
