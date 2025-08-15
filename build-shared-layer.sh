@@ -24,14 +24,14 @@ rm -f "$LAYER_ZIP"
 # Create layer directory structure
 # Lambda layers for Python must follow this structure:
 # python/lib/python3.x/site-packages/
-mkdir -p "$BUILD_DIR/python/lib/python3.11/site-packages"
+mkdir -p "$BUILD_DIR/python/lib/python3.13/site-packages"
 
 echo "Installing Python dependencies..."
 
 # Install shared dependencies into the layer
 pip install \
   --upgrade \
-  --target "$BUILD_DIR/python/lib/python3.11/site-packages" \
+  --target "$BUILD_DIR/python/lib/python3.13/site-packages" \
   --requirement "$SHARED_DIR/requirements.txt" \
   --no-cache-dir \
   --quiet
@@ -40,8 +40,8 @@ echo "Copying shared modules..."
 
 # Copy the shared modules to the layer
 # This allows imports like: from shared.models import MenuItem
-mkdir -p "$BUILD_DIR/python/lib/python3.11/site-packages/shared"
-cp "$SHARED_DIR"/*.py "$BUILD_DIR/python/lib/python3.11/site-packages/shared/"
+mkdir -p "$BUILD_DIR/python/lib/python3.13/site-packages/shared"
+cp "$SHARED_DIR"/*.py "$BUILD_DIR/python/lib/python3.13/site-packages/shared/"
 
 # Remove unnecessary files to reduce layer size
 echo "Optimizing layer size..."
@@ -78,20 +78,20 @@ echo "Layer package size: $LAYER_SIZE"
 
 # Verify the layer structure
 echo "Verifying layer structure..."
-if unzip -l "$LAYER_ZIP" | grep -q "python/lib/python3.11/site-packages/shared/"; then
+if unzip -l "$LAYER_ZIP" | grep -q "python/lib/python3.13/site-packages/shared/"; then
   echo "✓ Shared modules found in correct location"
 else
   echo "✗ Shared modules not found in expected location"
   exit 1
 fi
 
-if unzip -l "$LAYER_ZIP" | grep -q "python/lib/python3.11/site-packages/pydantic/"; then
+if unzip -l "$LAYER_ZIP" | grep -q "python/lib/python3.13/site-packages/pydantic/"; then
   echo "✓ Pydantic dependency found"
 else
   echo "✗ Pydantic dependency not found"
 fi
 
-if unzip -l "$LAYER_ZIP" | grep -q "python/lib/python3.11/site-packages/boto3/"; then
+if unzip -l "$LAYER_ZIP" | grep -q "python/lib/python3.13/site-packages/boto3/"; then
   echo "✓ Boto3 dependency found"
 else
   echo "✗ Boto3 dependency not found"
