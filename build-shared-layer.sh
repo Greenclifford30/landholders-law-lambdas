@@ -40,7 +40,8 @@ echo "Copying shared modules..."
 
 # Copy the shared modules to the layer
 # This allows imports like: from shared.models import MenuItem
-cp -r "$SHARED_DIR"/* "$BUILD_DIR/python/lib/python3.11/site-packages/"
+mkdir -p "$BUILD_DIR/python/lib/python3.11/site-packages/shared"
+cp "$SHARED_DIR"/*.py "$BUILD_DIR/python/lib/python3.11/site-packages/shared/"
 
 # Remove unnecessary files to reduce layer size
 echo "Optimizing layer size..."
