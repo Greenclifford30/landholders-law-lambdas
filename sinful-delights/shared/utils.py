@@ -13,6 +13,11 @@ def generate_id(prefix: str = "") -> str:
     return f"{prefix}_{unique_id}" if prefix else unique_id
 
 
+def generate_uuid() -> str:
+    """Generate a UUID string (alias for compatibility)"""
+    return str(uuid.uuid4())
+
+
 def validate_date_format(date_str: str) -> bool:
     """Validate YYYY-MM-DD date format"""
     if not isinstance(date_str, str):
@@ -95,6 +100,14 @@ def extract_query_params(event: Dict[str, Any]) -> Dict[str, Any]:
             normalized[key] = value
     
     return normalized
+
+
+def parse_pagination_params(event: Dict[str, Any]) -> tuple:
+    """Parse pagination parameters from Lambda event"""
+    params = event.get('queryStringParameters') or {}
+    page = max(1, int(params.get('page', 1)))
+    limit = max(1, min(200, int(params.get('limit', 50))))
+    return page, limit
 
 
 def extract_path_params(event: Dict[str, Any]) -> Dict[str, str]:
