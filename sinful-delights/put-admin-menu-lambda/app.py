@@ -1,14 +1,50 @@
 import json
 import os
+import sys
 import uuid
-import boto3
-from decimal import Decimal
+from datetime import datetime
 from typing import Any, Dict, List
-from boto3.dynamodb.conditions import Key
 
-TABLE_NAME = os.environ["TABLE_NAME"]
-dynamodb = boto3.resource("dynamodb")
-table = dynamodb.Table(TABLE_NAME)
+# Add shared modules to path
+sys.path.append('/opt/python')
+sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'shared'))
+
+try:
+    from shared.auth import validate_admin_access
+    from shared.errors import handle_exceptions, create_success_response, ValidationError, NotFoundError
+    from shared.dynamo import put_item, get_item, query_items, delete_item, batch_write
+    from shared.models import Menu, MenuItem
+    from shared.utils import generate_uuid, validate_date_format
+except ImportError:
+    # Fallback for local testing
+    import boto3
+    from decimal import Decimal
+    from boto3.dynamodb.conditions import Key
+    
+    TABLE_NAME = os.environ.get("TABLE_NAME", "SinfulDelights")
+    dynamodb = boto3.resource("dynamodb")
+    table = dynamodb.Table(TABLE_NAME)
+    
+    def validate_admin_access(event):
+        return 'X-API-Key' in event.get('headers', {})
+    
+    def handle_exceptions(func):
+        def wrapper(event, context):
+            try:
+                return func(event, context)
+            except Exception as e:
+                return _resp(500, {'error': {'code': 'INTERNAL', 'message': str(e)}})
+        return wrapper
+    
+    def create_success_response(data, status_code=200):
+        return _resp(status_code, data)
+    
+    def generate_uuid():
+        return str(uuid.uuid4())
+    
+    def validate_date_format(date_str):
+        import re
+        return bool(re.match(r'^\\d{4}-\\d{2}-\\d{2}$', date_str))
 
 # --- helpers ---------------------------------------------------------------
 
@@ -46,13 +82,21 @@ def validate_admin_token(event: Dict[str, Any]) -> bool:
 
 # --- handler ---------------------------------------------------------------
 
+@handle_exceptions
 def lambda_handler(event: Dict[str, Any], context: Any):
-    # Security (enable when wired)
-    # if not validate_api_key(event) or not validate_admin_token(event):
-    #     return _resp(401, {"error": "Unauthorized"})
+    """
+    PUT /admin/menu/{menuId} - Update an existing menu (OpenAPI compatible)
+    """
+    # Validate admin access
+    validate_admin_access(event)
 
     if event.get("httpMethod") == "OPTIONS":
         return _resp(200, {"ok": True})
+    
+    # Get menu ID from path parameters
+    menu_id = event.get('pathParameters', {}).get('menuId')
+    if not menu_id:
+        raise ValidationError("Missing menu ID in path")
 
     try:
         body = event.get("body") or "{}"

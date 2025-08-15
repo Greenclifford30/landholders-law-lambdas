@@ -252,6 +252,12 @@ class InventoryAdjustResponse(BaseModel):
     newStockQty: int
 
 
+class InventoryAdjustment(BaseModel):
+    """Alias for backward compatibility"""
+    itemId: str
+    adjustment: int
+
+
 # Error Models
 class ErrorDetail(BaseModel):
     code: ErrorCodeEnum
