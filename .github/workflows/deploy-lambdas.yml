@@ -5,6 +5,27 @@ on:
     branches: [ "main" ]
 
 jobs:
+  # First, ensure shared layer is deployed (for sinful-delights)
+  check-shared-layer:
+    name: Check Shared Layer Status
+    runs-on: ubuntu-latest
+    outputs:
+      layer-version: ${{ steps.get_layer.outputs.version }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v3
+
+      - name: Get current layer version
+        id: get_layer
+        run: |
+          if [ -f "sinful-delights/.layer-version" ]; then
+            LAYER_VERSION=$(grep "SINFUL_DELIGHTS_SHARED_LAYER_VERSION=" sinful-delights/.layer-version | cut -d'=' -f2)
+            echo "version=$LAYER_VERSION" >> $GITHUB_OUTPUT
+            echo "Found shared layer version: $LAYER_VERSION"
+          else
+            echo "version=1" >> $GITHUB_OUTPUT
+            echo "No layer version file found, using version 1"
+          fi
   discover-lambdas:
     name: Discover Lambda Folders
     runs-on: ubuntu-latest
@@ -34,7 +55,7 @@ jobs:
   build-and-deploy:
     name: Build and Deploy Each Lambda
     runs-on: ubuntu-latest
-    needs: [ discover-lambdas ]
+    needs: [ discover-lambdas, check-shared-layer ]
     environment: main
     strategy:
       fail-fast: false
@@ -57,8 +78,8 @@ jobs:
       - name: Build Lambda (if changed)
         if: steps.check_changes.outputs.changed == 'true'
         run: |
-          chmod +x build-lambda.sh
-          ./build-lambda.sh ${{ matrix.folder }}
+          chmod +x build-lambda-with-layer.sh
+          ./build-lambda-with-layer.sh ${{ matrix.folder }}
 
       - name: Configure AWS Credentials (if changed)
         if: steps.check_changes.outputs.changed == 'true'
@@ -74,9 +95,56 @@ jobs:
           PROJECT=$(echo "${{ matrix.folder }}" | cut -d'/' -f1)
           LAMBDA_FOLDER=$(echo "${{ matrix.folder }}" | cut -d'/' -f2)
           FUNCTION_NAME="${PROJECT}-${LAMBDA_FOLDER}"
+          LAYER_VERSION="${{ needs.check-shared-layer.outputs.layer-version }}"
 
           echo "Deploying to Lambda: $FUNCTION_NAME"
 
-          aws lambda update-function-code \
-            --function-name "$FUNCTION_NAME" \
-            --zip-file fileb://${{ matrix.folder }}/lambda.zip
+          # Update function code with retry logic
+          echo "Updating function code..."
+          for i in {1..3}; do
+            if aws lambda update-function-code \
+              --function-name "$FUNCTION_NAME" \
+              --zip-file fileb://${{ matrix.folder }}/lambda.zip; then
+              echo "✓ Function code updated successfully"
+              break
+            else
+              echo "⚠️  Attempt $i failed, waiting 30 seconds..."
+              sleep 30
+            fi
+          done
+
+          # Wait for function update to complete before layer update
+          echo "Waiting for function to be ready..."
+          aws lambda wait function-updated --function-name "$FUNCTION_NAME"
+
+          # Update layers for sinful-delights functions
+          if [ "$PROJECT" = "sinful-delights" ]; then
+            echo "Updating Lambda layers for sinful-delights function..."
+            
+            # Get AWS Account ID dynamically if secret not available
+            if [ -z "${{ secrets.AWS_ACCOUNT_ID }}" ]; then
+              AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+              echo "Retrieved AWS Account ID: $AWS_ACCOUNT_ID"
+            else
+              AWS_ACCOUNT_ID="${{ secrets.AWS_ACCOUNT_ID }}"
+              echo "Using AWS Account ID from secret: $AWS_ACCOUNT_ID"
+            fi
+            
+            LAYER_ARN="arn:aws:lambda:us-east-1:$AWS_ACCOUNT_ID:layer:sinful-delights-shared-layer:$LAYER_VERSION"
+            
+            # Retry layer configuration update
+            for i in {1..3}; do
+              if aws lambda update-function-configuration \
+                --function-name "$FUNCTION_NAME" \
+                --layers "$LAYER_ARN" \
+                --environment Variables="{PYTHONPATH=/opt/python}"; then
+                echo "✓ Updated function to use shared layer version $LAYER_VERSION"
+                break
+              else
+                echo "⚠️  Layer update attempt $i failed, waiting 30 seconds..."
+                sleep 30
+              fi
+            done
+          else
+            echo "Skipping layer update for non-sinful-delights function"
+          fi

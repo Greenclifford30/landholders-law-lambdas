@@ -1,0 +1,26 @@
+# Lambda-specific requirements for Sinful Delights functions
+# 
+# Note: The following dependencies are provided by the shared Lambda layer
+# and should NOT be included in lambda-specific requirements:
+# - boto3~=1.28
+# - pydantic~=2.0  
+# - python-jose~=3.3
+# - requests~=2.31
+#
+# Only include dependencies that are:
+# 1. Specific to this individual Lambda function
+# 2. Not included in the shared layer
+# 3. Required for this function's unique business logic
+#
+# Examples of lambda-specific dependencies might include:
+# - specialized data processing libraries
+# - specific API clients not used by other functions  
+# - function-specific validation libraries
+# - third-party services integrations unique to this function
+#
+# For most Sinful Delights functions, this file should be empty or very minimal
+# since common dependencies are provided by the shared layer.
+
+# Example lambda-specific dependency (uncomment if needed):
+# pillow>=9.0.0  # For image processing in specific functions
+# stripe>=5.0.0  # For payment processing functions only
