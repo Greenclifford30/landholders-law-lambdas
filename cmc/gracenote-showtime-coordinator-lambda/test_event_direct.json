@@ -1,0 +1,8 @@
+{
+  "source": "manual",
+  "provider": "gracenote",
+  "zip": "60422",
+  "radius": 30,
+  "numDays": 14,
+  "units": "mi"
+}

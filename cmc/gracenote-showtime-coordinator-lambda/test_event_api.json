@@ -1,0 +1,7 @@
+{
+  "body": "{\"zip\":\"60422\",\"radius\":30,\"numDays\":14,\"units\":\"mi\"}",
+  "requestContext": {
+    "httpMethod": "POST",
+    "resourcePath": "/admin/showtimes/gracenote/refresh"
+  }
+}

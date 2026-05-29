@@ -1,0 +1,8 @@
+{
+  "Records": [
+    {
+      "messageId": "example-message-id",
+      "body": "{\"provider\":\"gracenote\",\"zip\":\"60422\",\"radius\":30,\"numDays\":14,\"units\":\"mi\",\"startDate\":\"2026-05-28\"}"
+    }
+  ]
+}
