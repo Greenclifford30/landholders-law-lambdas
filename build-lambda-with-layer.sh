@@ -71,6 +71,10 @@ fi
 echo "Copying source code..."
 cp *.py build/ 2>/dev/null || echo "No Python files to copy"
 
+if [ "$PROJECT" = "cmc" ] && [ -f "../shared/cmc_shared.py" ]; then
+  cp ../shared/cmc_shared.py build/
+fi
+
 # Copy any additional files if they exist
 [ -f "*.json" ] && cp *.json build/ 2>/dev/null || true
 

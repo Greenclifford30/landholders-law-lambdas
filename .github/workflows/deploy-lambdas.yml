@@ -52,10 +52,25 @@ jobs:
           echo "folders-json=$json" >> $GITHUB_OUTPUT
           echo "::set-output name=folders-json::$json"
 
+  test-cmc:
+    name: Test CMC Lambdas
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.13'
+
+      - name: Run CMC unit tests
+        run: python -m unittest discover -s cmc/tests
+
   build-and-deploy:
     name: Build and Deploy Each Lambda
     runs-on: ubuntu-latest
-    needs: [ discover-lambdas, check-shared-layer ]
+    needs: [ discover-lambdas, check-shared-layer, test-cmc ]
     environment: main
     strategy:
       fail-fast: false
@@ -69,7 +84,10 @@ jobs:
       - name: Check if folder changed
         id: check_changes
         run: |
-          if git diff --quiet HEAD~1 HEAD -- ${{ matrix.folder }}; then
+          PROJECT=$(echo "${{ matrix.folder }}" | cut -d'/' -f1)
+          if [ "$PROJECT" = "cmc" ] && ! git diff --quiet HEAD~1 HEAD -- cmc/shared/; then
+            echo "changed=true" >> $GITHUB_OUTPUT
+          elif git diff --quiet HEAD~1 HEAD -- ${{ matrix.folder }}; then
             echo "changed=false" >> $GITHUB_OUTPUT
           else
             echo "changed=true" >> $GITHUB_OUTPUT
