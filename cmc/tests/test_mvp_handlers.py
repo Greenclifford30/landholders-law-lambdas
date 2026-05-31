@@ -100,6 +100,15 @@ class FakeTable:
         return FakeBatch(self)
 
 
+class FakeSes:
+    def __init__(self):
+        self.sent = []
+
+    def send_email(self, **kwargs):
+        self.sent.append(kwargs)
+        return {"MessageId": "fake-message"}
+
+
 class FakeDynamo:
     def __init__(self, table):
         self.table = table
@@ -114,9 +123,10 @@ class FakeSecrets:
 
 
 def install_fake_aws(fake_table):
+    fake_ses = FakeSes()
     fake_boto3 = types.SimpleNamespace(
         resource=lambda service_name: FakeDynamo(fake_table),
-        client=lambda service_name: FakeSecrets(),
+        client=lambda service_name: fake_ses if service_name == "ses" else FakeSecrets(),
     )
     fake_conditions = types.SimpleNamespace(Key=FakeKey)
     fake_exceptions = types.SimpleNamespace(ClientError=FakeClientError)
@@ -139,12 +149,15 @@ def load_app(lambda_dir, fake_table):
     return module
 
 
-def event(method="GET", path=None, body=None, user_id="user-1", club_id=None, movie_night_id=None, query=None):
+def event(method="GET", path=None, body=None, user_id="user-1", club_id=None, movie_night_id=None, query=None, groups="Admin"):
     path_params = {}
     if club_id:
         path_params["clubId"] = club_id
     if movie_night_id:
         path_params["movieNightId"] = movie_night_id
+    if path and "/invites/" in path:
+        parts = [part for part in path.split("/") if part]
+        path_params["token"] = parts[1]
     return {
         "httpMethod": method,
         "path": path or "/",
@@ -156,7 +169,7 @@ def event(method="GET", path=None, body=None, user_id="user-1", club_id=None, mo
                 "claims": {
                     "sub": user_id,
                     "email": f"{user_id}@example.com",
-                    "cognito:groups": "Admin",
+                    "cognito:groups": groups,
                 }
             }
         },
@@ -172,8 +185,87 @@ class MvpHandlerTests(unittest.TestCase):
         os.environ["APP_TABLE_NAME"] = "cmc_app"
         os.environ["TMDB_SECRET_ARN"] = "arn:aws:secretsmanager:tmdb"
         self.table = FakeTable()
-        self.table.put_item(Item={"PK": "CLUB#club-1", "SK": "MEMBER#user-1", "role": "admin"})
-        self.table.put_item(Item={"PK": "CLUB#club-1", "SK": "MEMBER#user-2", "role": "friend"})
+        self.table.put_item(Item={"PK": "CLUB#club-1", "SK": "META", "clubId": "club-1", "name": "Club One"})
+        self.table.put_item(
+            Item={
+                "PK": "CLUB#club-1",
+                "SK": "MEMBER#user-1",
+                "GSI1PK": "USER#user-1",
+                "GSI1SK": "CLUB#club-1",
+                "clubId": "club-1",
+                "userId": "user-1",
+                "email": "user-1@example.com",
+                "role": "admin",
+                "status": "active",
+            }
+        )
+        self.table.put_item(
+            Item={
+                "PK": "CLUB#club-1",
+                "SK": "MEMBER#user-2",
+                "GSI1PK": "USER#user-2",
+                "GSI1SK": "CLUB#club-1",
+                "clubId": "club-1",
+                "userId": "user-2",
+                "email": "user-2@example.com",
+                "role": "friend",
+                "status": "active",
+            }
+        )
+
+    def test_platform_admin_can_create_club(self):
+        app = load_app("manage-clubs-lambda", self.table)
+        result = app.handler(event("POST", body={"name": "Friday Films"}), None)
+        self.assertEqual(201, result["statusCode"])
+        club_id = body(result)["club"]["clubId"]
+        self.assertIn((f"CLUB#{club_id}", "META"), self.table.items)
+        self.assertIn((f"CLUB#{club_id}", "MEMBER#user-1"), self.table.items)
+
+    def test_non_platform_admin_cannot_create_club(self):
+        app = load_app("manage-clubs-lambda", self.table)
+        result = app.handler(event("POST", body={"name": "Friday Films"}, user_id="user-2", groups="Friend"), None)
+        self.assertEqual(403, result["statusCode"])
+
+    def test_list_clubs_returns_user_memberships(self):
+        app = load_app("manage-clubs-lambda", self.table)
+        result = app.handler(event(user_id="user-2"), None)
+        self.assertEqual(200, result["statusCode"])
+        self.assertEqual(["club-1"], [club["clubId"] for club in body(result)["clubs"]])
+
+    def test_club_admin_can_invite_email(self):
+        app = load_app("manage-invites-lambda", self.table)
+        result = app.handler(event("POST", club_id="club-1", body={"emails": ["NewUser@example.com"]}), None)
+        self.assertEqual(201, result["statusCode"])
+        invite = body(result)["invites"][0]
+        self.assertEqual("newuser@example.com", invite["email"])
+        self.assertNotIn("tokenHash", invite)
+
+    def test_non_admin_cannot_invite_email(self):
+        app = load_app("manage-invites-lambda", self.table)
+        result = app.handler(event("POST", club_id="club-1", user_id="user-2", body={"emails": ["new@example.com"]}), None)
+        self.assertEqual(403, result["statusCode"])
+
+    def test_accept_invite_creates_friend_membership(self):
+        app = load_app("manage-invites-lambda", self.table)
+        created = app.handler(event("POST", club_id="club-1", body={"emails": ["joiner@example.com"]}), None)
+        token = body(created)["invites"][0]["inviteUrl"].rsplit("/", 1)[-1]
+        accepted = app.handler(event("POST", path=f"/invites/{token}", user_id="joiner", body={}), None)
+        self.assertEqual(200, accepted["statusCode"])
+        self.assertEqual("friend", self.table.items[("CLUB#club-1", "MEMBER#joiner")]["role"])
+
+    def test_accept_invite_rejects_wrong_email(self):
+        app = load_app("manage-invites-lambda", self.table)
+        created = app.handler(event("POST", club_id="club-1", body={"emails": ["joiner@example.com"]}), None)
+        token = body(created)["invites"][0]["inviteUrl"].rsplit("/", 1)[-1]
+        accepted = app.handler(event("POST", path=f"/invites/{token}", user_id="someone-else", body={}), None)
+        self.assertEqual(403, accepted["statusCode"])
+
+    def test_list_invites_returns_pending_invites(self):
+        app = load_app("manage-invites-lambda", self.table)
+        app.handler(event("POST", club_id="club-1", body={"emails": ["pending@example.com"]}), None)
+        result = app.handler(event("GET", club_id="club-1"), None)
+        self.assertEqual(200, result["statusCode"])
+        self.assertEqual(["pending@example.com"], [invite["email"] for invite in body(result)["invites"]])
 
     def test_movie_search_returns_normalized_tmdb_results(self):
         app = load_app("movie-search-lambda", self.table)

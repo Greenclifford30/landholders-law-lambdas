@@ -13,6 +13,7 @@ ACTIVE_STATUSES = {"planning", "voting", "confirmed"}
 HISTORY_STATUSES = {"confirmed", "completed", "cancelled"}
 ADMIN_ROLES = {"admin"}
 PARTICIPANT_ROLES = {"admin", "friend", "guest"}
+PLATFORM_ADMIN_GROUPS = {"Admin", "admin", "PlatformAdmin", "platform-admin"}
 
 dynamodb = boto3.resource("dynamodb")
 
@@ -172,6 +173,23 @@ def require_membership(club_id, user_id, allowed_roles=None):
     if allowed_roles and role not in allowed_roles:
         raise ApiError(403, "User is not allowed to perform this action.")
     return item
+
+
+def is_platform_admin(user):
+    return any(group in PLATFORM_ADMIN_GROUPS for group in user.get("groups", []))
+
+
+def require_platform_admin(user):
+    if not is_platform_admin(user):
+        raise ApiError(403, "Platform admin access is required.")
+
+
+def public_club(item, membership=None):
+    body = public_movie_night(item)
+    if membership:
+        body["role"] = membership.get("role")
+        body["membershipStatus"] = membership.get("status", "active")
+    return body
 
 
 def require_movie_night_membership(movie_night_id, user_id, allowed_roles=None):
