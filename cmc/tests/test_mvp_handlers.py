@@ -220,6 +220,12 @@ class MvpHandlerTests(unittest.TestCase):
         club_id = body(result)["club"]["clubId"]
         self.assertIn((f"CLUB#{club_id}", "META"), self.table.items)
         self.assertIn((f"CLUB#{club_id}", "MEMBER#user-1"), self.table.items)
+        self.assertEqual("admin", self.table.items[(f"CLUB#{club_id}", "MEMBER#user-1")]["role"])
+
+    def test_duplicate_club_id_returns_conflict(self):
+        app = load_app("manage-clubs-lambda", self.table)
+        result = app.handler(event("POST", body={"name": "Duplicate", "clubId": "club-1"}), None)
+        self.assertEqual(409, result["statusCode"])
 
     def test_non_platform_admin_cannot_create_club(self):
         app = load_app("manage-clubs-lambda", self.table)

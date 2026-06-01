@@ -134,7 +134,7 @@ def create_invites(event):
             "status": "pending",
             "tokenHash": token_hash(raw_token),
             "expiresAt": expiry_iso(),
-            "expiresAtEpoch": expiry_epoch(),
+            # "expiresAtEpoch": expiry_epoch(),
             "createdBy": user["userId"],
             "createdAt": created_at,
             "updatedAt": created_at,
