@@ -6,15 +6,18 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import boto3
+from boto3.dynamodb.conditions import Key
 
 
 logger = logging.getLogger()
 logger.setLevel(os.environ.get("LOG_LEVEL", "INFO").upper())
 
 sqs = boto3.client("sqs")
+dynamodb = boto3.resource("dynamodb")
 
 VALID_UNITS = {"mi", "km"}
 ZIP_RE = re.compile(r"^\d{5}(?:-\d{4})?$")
+SEARCH_LIMIT = 100
 
 
 class ValidationError(Exception):
@@ -27,6 +30,13 @@ def response(status_code, body):
         "headers": {"Content-Type": "application/json"},
         "body": json.dumps(body),
     }
+
+
+def table():
+    table_name = os.environ.get("APP_TABLE_NAME")
+    if not table_name:
+        raise RuntimeError("APP_TABLE_NAME is not configured.")
+    return dynamodb.Table(table_name)
 
 
 def is_api_gateway_event(event):
@@ -52,6 +62,15 @@ def parse_payload(event):
     return event
 
 
+def query_params(event):
+    return event.get("queryStringParameters") or {}
+
+
+def normalize_title(value):
+    normalized = re.sub(r"[^a-z0-9]+", " ", str(value or "").lower())
+    return " ".join(normalized.split())
+
+
 def get_int(payload, name, default, min_value, max_value):
     value = payload.get(name, default)
     try:
@@ -64,12 +83,12 @@ def get_int(payload, name, default, min_value, max_value):
     return parsed
 
 
-def resolve_refresh_request(event):
-    payload = parse_payload(event)
+def current_local_date():
     timezone_name = os.environ.get("MOVIE_CLUB_TIMEZONE", "America/Chicago")
-    now_utc = datetime.utcnow().replace(microsecond=0)
-    today_local = datetime.now(ZoneInfo(timezone_name)).date().isoformat()
+    return datetime.now(ZoneInfo(timezone_name)).date().isoformat()
 
+
+def validate_common_window(payload):
     zip_code = str(payload.get("zip") or os.environ.get("GRACENOTE_DEFAULT_ZIP", "")).strip()
     if not ZIP_RE.match(zip_code):
         raise ValidationError("zip must be a 5 digit ZIP code or ZIP+4.")
@@ -93,11 +112,25 @@ def resolve_refresh_request(event):
     if units not in VALID_UNITS:
         raise ValidationError("units must be either 'mi' or 'km'.")
 
-    start_date = str(payload.get("startDate") or today_local).strip()
+    start_date = str(payload.get("startDate") or current_local_date()).strip()
     try:
         datetime.strptime(start_date, "%Y-%m-%d")
     except ValueError as exc:
         raise ValidationError("startDate must use yyyy-mm-dd format.") from exc
+
+    return {
+        "zip": zip_code,
+        "radius": radius,
+        "numDays": num_days,
+        "units": units,
+        "startDate": start_date,
+    }
+
+
+def resolve_refresh_request(event):
+    payload = parse_payload(event)
+    now_utc = datetime.utcnow().replace(microsecond=0)
+    window = validate_common_window(payload)
 
     requested_by = payload.get("requestedBy") or payload.get("source") or event.get("source")
     if not requested_by:
@@ -105,11 +138,7 @@ def resolve_refresh_request(event):
 
     message = {
         "provider": "gracenote",
-        "zip": zip_code,
-        "radius": radius,
-        "numDays": num_days,
-        "units": units,
-        "startDate": start_date,
+        **window,
         "requestedBy": requested_by,
         "requestedAt": f"{now_utc.isoformat()}Z",
     }
@@ -122,10 +151,95 @@ def resolve_refresh_request(event):
     return message
 
 
+def is_search_request(event):
+    if not is_api_gateway_event(event):
+        return False
+    method = event.get("httpMethod") or (event.get("requestContext") or {}).get("httpMethod")
+    resource_path = (event.get("requestContext") or {}).get("resourcePath") or event.get("resource") or event.get("path") or ""
+    return method == "GET" and resource_path.endswith("/admin/showtimes/gracenote/search")
+
+
+def resolve_search_request(event):
+    payload = query_params(event)
+    window = validate_common_window(payload)
+    title = str(payload.get("title") or "").strip()
+    if not title:
+        raise ValidationError("title is required.")
+    provider = str(payload.get("provider") or "gracenote").strip()
+    if provider and provider != "gracenote" and provider != "tmdb":
+        raise ValidationError("provider must be gracenote or tmdb.")
+    return {
+        **window,
+        "title": title,
+        "normalizedTitle": normalize_title(title),
+        "provider": provider,
+        "providerMovieId": str(payload.get("providerMovieId") or "").strip(),
+    }
+
+
+def cache_pk(search):
+    return (
+        "SHOWTIME_CACHE#PROVIDER#gracenote"
+        f"#ZIP#{search['zip']}#DATE#{search['startDate']}"
+    )
+
+
+def values_equal(left, right):
+    return str(left) == str(right)
+
+
+def matches_search(item, search):
+    item_title = normalize_title(item.get("title"))
+    requested_title = search["normalizedTitle"]
+    if not item_title or not requested_title:
+        return False
+    title_matches = item_title == requested_title or requested_title in item_title or item_title in requested_title
+    if not title_matches:
+        return False
+    if item.get("radius") is not None and not values_equal(item.get("radius"), search["radius"]):
+        return False
+    if item.get("units") is not None and item.get("units") != search["units"]:
+        return False
+    return True
+
+
+def public_cached_showtime(item):
+    return {
+        "PK": item.get("PK", ""),
+        "SK": item.get("SK", ""),
+        "provider": item.get("provider", "gracenote"),
+        "providerShowtimeId": item.get("providerShowtimeId") or item.get("SK", ""),
+        "providerMovieId": item.get("providerMovieId") or item.get("tmsId") or item.get("rootId") or "",
+        "providerTheaterId": item.get("providerTheaterId") or item.get("theatreId") or "",
+        "theaterName": item.get("theaterName") or item.get("theatreName") or "",
+        "theaterLocation": item.get("theaterLocation") or item.get("theatreLocation") or "",
+        "startsAtUtc": item.get("startsAtUtc") or "",
+        "localDateTime": item.get("localDateTime") or "",
+        "screenFormat": item.get("screenFormat") or "Standard",
+        "ticketURI": item.get("ticketURI") or "",
+        "quals": item.get("quals") or [],
+    }
+
+
+def search_cached_showtimes(event):
+    search = resolve_search_request(event)
+    result = table().query(KeyConditionExpression=Key("PK").eq(cache_pk(search)))
+    showtimes = [
+        public_cached_showtime(item)
+        for item in result.get("Items", [])
+        if matches_search(item, search) and item.get("startsAtUtc")
+    ]
+    showtimes.sort(key=lambda item: (item.get("startsAtUtc") or "", item.get("theaterName") or ""))
+    return {"showtimes": showtimes[:SEARCH_LIMIT]}
+
+
 def handler(event, context):
     api_event = is_api_gateway_event(event)
 
     try:
+        if is_search_request(event):
+            return response(200, search_cached_showtimes(event))
+
         queue_url = os.environ["SHOWTIME_REFRESH_QUEUE_URL"]
         message = resolve_refresh_request(event)
         sqs.send_message(QueueUrl=queue_url, MessageBody=json.dumps(message))

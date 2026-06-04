@@ -518,6 +518,81 @@ class MvpHandlerTests(unittest.TestCase):
         self.assertEqual(201, result["statusCode"])
         self.assertIn(("MOVIE_NIGHT#mn-1", "SHOWTIME#st-1"), self.table.items)
 
+    def seed_cached_showtime(self):
+        key = {
+            "PK": "SHOWTIME_CACHE#PROVIDER#gracenote#ZIP#60422#DATE#2026-06-05",
+            "SK": "MOVIE#MV0123456789#THEATER#999#START#2026-06-05T19:30:00#FORMAT#abc",
+        }
+        self.table.put_item(
+            Item={
+                **key,
+                "provider": "gracenote",
+                "tmsId": "MV0123456789",
+                "rootId": "12345",
+                "title": "Heat",
+                "theatreId": "999",
+                "theatreName": "Music Box Theatre",
+                "theatreLocation": "3733 N Southport Ave",
+                "startsAtUtc": "2026-06-06T00:30:00Z",
+                "localDateTime": "2026-06-05T19:30:00",
+                "screenFormat": "70mm",
+                "ticketURI": "https://tickets.example",
+                "quals": ["70mm"],
+            }
+        )
+        return key
+
+    def test_manage_showtimes_imports_cached_showtime(self):
+        self.seed_movie_night("planning")
+        cache_key = self.seed_cached_showtime()
+        app = load_app("manage-showtimes-lambda", self.table)
+        result = app.handler(event("POST", movie_night_id="mn-1", body={"cachedShowtimeKeys": [cache_key]}), None)
+
+        self.assertEqual(201, result["statusCode"])
+        imported = body(result)["showtimes"][0]
+        self.assertEqual("Music Box Theatre", imported["theaterName"])
+        self.assertEqual("2026-06-06T00:30:00Z", imported["startsAtUtc"])
+        self.assertEqual("MV0123456789", imported["providerMovieId"])
+        self.assertEqual("999", imported["providerTheaterId"])
+        self.assertEqual("70mm", imported["screenFormat"])
+        self.assertEqual("https://tickets.example", imported["ticketURI"])
+        self.assertEqual(["70mm"], imported["quals"])
+        self.assertIn(("MOVIE_NIGHT#mn-1", f"SHOWTIME#{imported['showtimeId']}"), self.table.items)
+
+    def test_manage_showtimes_cached_import_is_idempotent(self):
+        self.seed_movie_night("planning")
+        cache_key = self.seed_cached_showtime()
+        app = load_app("manage-showtimes-lambda", self.table)
+        first = app.handler(event("POST", movie_night_id="mn-1", body={"cachedShowtimeKeys": [cache_key]}), None)
+        second = app.handler(event("POST", movie_night_id="mn-1", body={"cachedShowtimeKeys": [cache_key]}), None)
+
+        first_id = body(first)["showtimes"][0]["showtimeId"]
+        second_id = body(second)["showtimes"][0]["showtimeId"]
+        self.assertEqual(first_id, second_id)
+        imported_keys = [key for key in self.table.items if key[0] == "MOVIE_NIGHT#mn-1" and key[1].startswith("SHOWTIME#")]
+        self.assertEqual(1, len(imported_keys))
+
+    def test_manage_showtimes_cached_import_rejects_missing_key(self):
+        self.seed_movie_night("planning")
+        app = load_app("manage-showtimes-lambda", self.table)
+        result = app.handler(
+            event(
+                "POST",
+                movie_night_id="mn-1",
+                body={"cachedShowtimeKeys": [{"PK": "SHOWTIME_CACHE#missing", "SK": "MOVIE#missing"}]},
+            ),
+            None,
+        )
+
+        self.assertEqual(404, result["statusCode"])
+
+    def test_manage_showtimes_cached_import_rejects_malformed_key(self):
+        self.seed_movie_night("planning")
+        app = load_app("manage-showtimes-lambda", self.table)
+        result = app.handler(event("POST", movie_night_id="mn-1", body={"cachedShowtimeKeys": [{"PK": "SHOWTIME_CACHE#missing"}]}), None)
+
+        self.assertEqual(400, result["statusCode"])
+
     def test_submit_vote_rejects_duplicate_rankings(self):
         self.seed_movie_night()
         self.seed_showtime()

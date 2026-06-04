@@ -1,3 +1,5 @@
+import hashlib
+
 from cmc_shared import (
     ADMIN_ROLES,
     ApiError,
@@ -15,6 +17,11 @@ from cmc_shared import (
     response,
     table,
 )
+
+
+def cached_showtime_id(cache_key):
+    raw_key = f"{cache_key['PK']}#{cache_key['SK']}"
+    return f"st_cache_{hashlib.sha256(raw_key.encode('utf-8')).hexdigest()[:12]}"
 
 
 def normalize_manual_showtime(movie_night_id, raw, created_at):
@@ -55,11 +62,13 @@ def from_cache(movie_night_id, cache_key, created_at):
     return normalize_manual_showtime(
         movie_night_id,
         {
+            "showtimeId": cached_showtime_id(cache_key),
             "provider": cached.get("provider", "gracenote"),
-            "providerShowtimeId": cached.get("SK"),
-            "providerMovieId": cached.get("tmsId") or cached.get("rootId"),
-            "providerTheaterId": cached.get("theatreId"),
-            "theaterName": cached.get("theatreName"),
+            "providerShowtimeId": cached.get("providerShowtimeId") or cached.get("SK"),
+            "providerMovieId": cached.get("providerMovieId") or cached.get("tmsId") or cached.get("rootId"),
+            "providerTheaterId": cached.get("providerTheaterId") or cached.get("theatreId"),
+            "theaterName": cached.get("theaterName") or cached.get("theatreName"),
+            "theaterLocation": cached.get("theaterLocation") or cached.get("theatreLocation", ""),
             "startsAtUtc": cached.get("startsAtUtc"),
             "localDateTime": cached.get("localDateTime"),
             "screenFormat": cached.get("screenFormat", "Standard"),
