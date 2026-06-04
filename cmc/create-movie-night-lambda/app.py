@@ -2,10 +2,8 @@ from botocore.exceptions import ClientError
 from datetime import datetime
 
 from cmc_shared import (
-    ACTIVE_STATUSES,
     ADMIN_ROLES,
     ApiError,
-    active_pointer,
     claims,
     club_pk,
     handle,
@@ -14,11 +12,10 @@ from cmc_shared import (
     now_iso,
     parse_body,
     path_param,
-    put_item,
     require_membership,
     require_string,
     response,
-    table,
+    transact_put_items,
 )
 
 
@@ -34,10 +31,6 @@ def handler(event, context):
         datetime.strptime(target_date, "%Y-%m-%d")
     except ValueError as exc:
         raise ApiError(400, "targetDate must use yyyy-mm-dd format.") from exc
-
-    pointer = active_pointer(club_id)
-    if pointer and pointer.get("status") in ACTIVE_STATUSES:
-        raise ApiError(409, "Club already has an active movie night.")
 
     movie_night_id = payload.get("movieNightId") or new_id("mn")
     created_at = now_iso()
@@ -69,14 +62,32 @@ def handler(event, context):
     }
 
     try:
-        table().put_item(
-            Item=item,
-            ConditionExpression="attribute_not_exists(PK) AND attribute_not_exists(SK)",
+        transact_put_items(
+            [
+                {
+                    "Item": item,
+                    "ConditionExpression": "attribute_not_exists(PK) AND attribute_not_exists(SK)",
+                },
+                {
+                    "Item": pointer_item,
+                    "ConditionExpression": (
+                        "attribute_not_exists(PK) OR NOT (#status IN (:planning, :voting, :confirmed))"
+                    ),
+                    "ExpressionAttributeNames": {"#status": "status"},
+                    "ExpressionAttributeValues": {
+                        ":planning": "planning",
+                        ":voting": "voting",
+                        ":confirmed": "confirmed",
+                    },
+                },
+            ]
         )
-        put_item(pointer_item)
     except ClientError as exc:
-        if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
-            raise ApiError(409, "Movie night already exists.") from exc
+        if exc.response.get("Error", {}).get("Code") in {
+            "ConditionalCheckFailedException",
+            "TransactionCanceledException",
+        }:
+            raise ApiError(409, "Movie night already exists or club already has an active movie night.") from exc
         raise
 
     return response(201, {"movieNight": {k: v for k, v in item.items() if not k.startswith("GSI") and k not in {"PK", "SK"}}})

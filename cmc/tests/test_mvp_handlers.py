@@ -4,6 +4,7 @@ import os
 import sys
 import types
 import unittest
+from decimal import Decimal
 from pathlib import Path
 from unittest.mock import patch
 
@@ -37,6 +38,22 @@ class FakeKey:
         return KeyExpression([(self.name, "begins_with", value)])
 
 
+class FakeTypeSerializer:
+    def serialize(self, value):
+        self._reject_float(value)
+        return value
+
+    def _reject_float(self, value):
+        if isinstance(value, float):
+            raise TypeError("Float types are not supported. Use Decimal types instead.")
+        if isinstance(value, dict):
+            for nested_value in value.values():
+                self._reject_float(nested_value)
+        if isinstance(value, list):
+            for nested_value in value:
+                self._reject_float(nested_value)
+
+
 class FakeBatch:
     def __init__(self, table):
         self.table = table
@@ -54,6 +71,7 @@ class FakeBatch:
 class FakeTable:
     def __init__(self):
         self.items = {}
+        self.fail_transact = False
 
     def put_item(self, Item, ConditionExpression=None):
         key = (Item["PK"], Item["SK"])
@@ -61,6 +79,40 @@ class FakeTable:
             raise FakeClientError({"Error": {"Code": "ConditionalCheckFailedException"}}, "PutItem")
         self.items[key] = dict(Item)
         return {}
+
+    def transact_write_items(self, TransactItems):
+        if self.fail_transact:
+            raise FakeClientError(
+                {"Error": {"Code": "ProvisionedThroughputExceededException", "Message": "throttled"}},
+                "TransactWriteItems",
+            )
+        puts = [item["Put"] for item in TransactItems]
+        for put in puts:
+            item = put["Item"]
+            existing = self.items.get((item["PK"], item["SK"]))
+            condition = put.get("ConditionExpression")
+            if condition and not self._condition_matches(condition, existing, put):
+                raise FakeClientError(
+                    {"Error": {"Code": "TransactionCanceledException", "Message": "condition failed"}},
+                    "TransactWriteItems",
+                )
+        for put in puts:
+            item = put["Item"]
+            self.items[(item["PK"], item["SK"])] = dict(item)
+        return {}
+
+    def _condition_matches(self, condition, existing, put):
+        if condition == "attribute_not_exists(PK) AND attribute_not_exists(SK)":
+            return existing is None
+        if condition == "attribute_not_exists(PK) OR NOT (#status IN (:planning, :voting, :confirmed))":
+            if existing is None:
+                return True
+            names = put.get("ExpressionAttributeNames") or {}
+            values = put.get("ExpressionAttributeValues") or {}
+            status_attr = names.get("#status", "status")
+            active_statuses = {values[":planning"], values[":voting"], values[":confirmed"]}
+            return existing.get(status_attr) not in active_statuses
+        return True
 
     def get_item(self, Key):
         item = self.items.get((Key["PK"], Key["SK"]))
@@ -117,6 +169,14 @@ class FakeDynamo:
         return self.table
 
 
+class FakeDynamoClient:
+    def __init__(self, table):
+        self.table = table
+
+    def transact_write_items(self, TransactItems):
+        return self.table.transact_write_items(TransactItems)
+
+
 class FakeSecrets:
     def get_secret_value(self, SecretId):
         return {"SecretString": '{"access_token":"tmdb-token"}'}
@@ -126,13 +186,19 @@ def install_fake_aws(fake_table):
     fake_ses = FakeSes()
     fake_boto3 = types.SimpleNamespace(
         resource=lambda service_name: FakeDynamo(fake_table),
-        client=lambda service_name: fake_ses if service_name == "ses" else FakeSecrets(),
+        client=lambda service_name: FakeDynamoClient(fake_table)
+        if service_name == "dynamodb"
+        else fake_ses
+        if service_name == "ses"
+        else FakeSecrets(),
     )
     fake_conditions = types.SimpleNamespace(Key=FakeKey)
+    fake_types = types.SimpleNamespace(TypeSerializer=FakeTypeSerializer)
     fake_exceptions = types.SimpleNamespace(ClientError=FakeClientError)
     sys.modules["boto3"] = fake_boto3
     sys.modules["boto3.dynamodb"] = types.SimpleNamespace(conditions=fake_conditions)
     sys.modules["boto3.dynamodb.conditions"] = fake_conditions
+    sys.modules["boto3.dynamodb.types"] = fake_types
     sys.modules["botocore"] = types.SimpleNamespace(exceptions=fake_exceptions)
     sys.modules["botocore.exceptions"] = fake_exceptions
     sys.modules.setdefault("requests", types.SimpleNamespace(get=lambda *args, **kwargs: None))
@@ -304,7 +370,10 @@ class MvpHandlerTests(unittest.TestCase):
             event(
                 "POST",
                 club_id="club-1",
-                body={"targetDate": "2026-06-01", "movie": {"externalId": "1", "title": "Heat"}},
+                body={
+                    "targetDate": "2026-06-01",
+                    "movie": {"externalId": "1", "title": "Heat", "rating": 8.5, "popularity": 123.4},
+                },
             ),
             None,
         )
@@ -312,6 +381,98 @@ class MvpHandlerTests(unittest.TestCase):
         movie_night_id = body(result)["movieNight"]["movieNightId"]
         self.assertIn(("CLUB#club-1", "ACTIVE_MOVIE_NIGHT"), self.table.items)
         self.assertEqual(movie_night_id, self.table.items[("CLUB#club-1", "ACTIVE_MOVIE_NIGHT")]["movieNightId"])
+        stored_movie = self.table.items[("CLUB#club-1", f"MOVIE_NIGHT#{movie_night_id}")]["movie"]
+        self.assertEqual(Decimal("8.5"), stored_movie["rating"])
+        self.assertEqual(Decimal("123.4"), stored_movie["popularity"])
+
+    def test_create_movie_night_duplicate_id_returns_conflict(self):
+        self.table.put_item(
+            Item={
+                "PK": "CLUB#club-1",
+                "SK": "MOVIE_NIGHT#mn-duplicate",
+                "movieNightId": "mn-duplicate",
+            }
+        )
+        app = load_app("create-movie-night-lambda", self.table)
+        result = app.handler(
+            event(
+                "POST",
+                club_id="club-1",
+                body={
+                    "movieNightId": "mn-duplicate",
+                    "targetDate": "2026-06-01",
+                    "movie": {"externalId": "1", "title": "Heat"},
+                },
+            ),
+            None,
+        )
+        self.assertEqual(409, result["statusCode"])
+        self.assertNotIn(("CLUB#club-1", "ACTIVE_MOVIE_NIGHT"), self.table.items)
+
+    def test_create_movie_night_existing_active_pointer_returns_conflict(self):
+        self.table.put_item(
+            Item={
+                "PK": "CLUB#club-1",
+                "SK": "ACTIVE_MOVIE_NIGHT",
+                "movieNightId": "mn-active",
+                "status": "planning",
+            }
+        )
+        app = load_app("create-movie-night-lambda", self.table)
+        result = app.handler(
+            event(
+                "POST",
+                club_id="club-1",
+                body={
+                    "movieNightId": "mn-new",
+                    "targetDate": "2026-06-01",
+                    "movie": {"externalId": "1", "title": "Heat"},
+                },
+            ),
+            None,
+        )
+        self.assertEqual(409, result["statusCode"])
+        self.assertNotIn(("CLUB#club-1", "MOVIE_NIGHT#mn-new"), self.table.items)
+        self.assertEqual("mn-active", self.table.items[("CLUB#club-1", "ACTIVE_MOVIE_NIGHT")]["movieNightId"])
+
+    def test_create_movie_night_transaction_failure_does_not_leave_partial_records(self):
+        self.table.fail_transact = True
+        app = load_app("create-movie-night-lambda", self.table)
+        with self.assertLogs("cmc_shared", level="ERROR"):
+            result = app.handler(
+                event(
+                    "POST",
+                    club_id="club-1",
+                    body={
+                        "movieNightId": "mn-failed",
+                        "targetDate": "2026-06-01",
+                        "movie": {"externalId": "1", "title": "Heat"},
+                    },
+                ),
+                None,
+            )
+        self.assertEqual(500, result["statusCode"])
+        self.assertNotIn(("CLUB#club-1", "MOVIE_NIGHT#mn-failed"), self.table.items)
+        self.assertNotIn(("CLUB#club-1", "ACTIVE_MOVIE_NIGHT"), self.table.items)
+
+    def test_shared_handler_logs_client_error_without_leaking_details(self):
+        load_app("create-movie-night-lambda", self.table)
+        cmc_shared = sys.modules["cmc_shared"]
+
+        def failing_handler(_event, _context):
+            raise FakeClientError(
+                {"Error": {"Code": "AccessDeniedException", "Message": "secret detail"}},
+                "PutItem",
+            )
+
+        wrapped = cmc_shared.handle(failing_handler)
+        with self.assertLogs("cmc_shared", level="ERROR") as logs:
+            result = wrapped({}, None)
+
+        self.assertEqual(500, result["statusCode"])
+        self.assertEqual({"error": "AWS service request failed."}, body(result))
+        self.assertIn("AccessDeniedException", "\n".join(logs.output))
+        self.assertNotIn("secret detail", body(result)["error"])
 
     def test_get_active_movie_night_returns_404_when_empty(self):
         app = load_app("get-active-movie-night-lambda", self.table)
