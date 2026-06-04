@@ -20,6 +20,9 @@ class KeyExpression:
     def __init__(self, conditions):
         self.conditions = conditions
 
+    def __and__(self, other):
+        return KeyExpression(self.conditions + other.conditions)
+
 
 class FakeKey:
     def __init__(self, name):
@@ -28,11 +31,15 @@ class FakeKey:
     def eq(self, value):
         return KeyExpression([(self.name, "eq", value)])
 
+    def begins_with(self, value):
+        return KeyExpression([(self.name, "begins_with", value)])
+
 
 class FakeTable:
     def __init__(self):
         self.items = []
         self.queries = []
+        self.page_size = None
 
     def query(self, KeyConditionExpression, **kwargs):
         self.queries.append((KeyConditionExpression, kwargs))
@@ -43,9 +50,27 @@ class FakeTable:
             for attr, op, value in conditions:
                 if op == "eq" and item.get(attr) != value:
                     ok = False
+                if op == "begins_with" and not str(item.get(attr, "")).startswith(value):
+                    ok = False
             if ok:
                 matched.append(dict(item))
-        return {"Items": matched}
+
+        start = 0
+        exclusive_start_key = kwargs.get("ExclusiveStartKey")
+        if exclusive_start_key:
+            for index, item in enumerate(matched):
+                if item.get("PK") == exclusive_start_key.get("PK") and item.get("SK") == exclusive_start_key.get("SK"):
+                    start = index + 1
+                    break
+
+        limit = kwargs.get("Limit") or len(matched)
+        if self.page_size:
+            limit = min(limit, self.page_size)
+        page = matched[start:start + limit]
+        result = {"Items": page}
+        if start + limit < len(matched) and page:
+            result["LastEvaluatedKey"] = {"PK": page[-1]["PK"], "SK": page[-1]["SK"]}
+        return result
 
 
 class FakeDynamo:
@@ -132,7 +157,8 @@ class CoordinatorTests(unittest.TestCase):
         self.fake_table.items.append(
             {
                 "PK": "SHOWTIME_CACHE#PROVIDER#gracenote#ZIP#60422#DATE#2026-06-05",
-                "SK": "MOVIE#MV0123456789#THEATER#999#START#2026-06-05T19:30:00#FORMAT#abc",
+                "SK": "TITLE#mission impossible the final reckoning#MOVIE#MV0123456789#THEATER#999#START#2026-06-05T19:30:00#FORMAT#abc",
+                "normalizedTitle": "mission impossible the final reckoning",
                 "provider": "gracenote",
                 "tmsId": "MV0123456789",
                 "rootId": "12345",
@@ -177,14 +203,96 @@ class CoordinatorTests(unittest.TestCase):
         self.assertEqual("999", showtime["providerTheaterId"])
         self.assertEqual("MV0123456789", showtime["providerMovieId"])
         self.assertEqual("2026-06-06T00:30:00Z", showtime["startsAtUtc"])
-        queried_key = self.fake_table.queries[0][0].conditions[0][2]
-        self.assertEqual("SHOWTIME_CACHE#PROVIDER#gracenote#ZIP#60422#DATE#2026-06-05", queried_key)
+        queried_conditions = self.fake_table.queries[0][0].conditions
+        self.assertEqual(("PK", "eq", "SHOWTIME_CACHE#PROVIDER#gracenote#ZIP#60422#DATE#2026-06-05"), queried_conditions[0])
+        self.assertEqual(("SK", "begins_with", "TITLE#mission impossible the final reckoning#"), queried_conditions[1])
+
+    def test_search_cache_queries_each_date_in_window(self):
+        self.fake_table.items.append(
+            {
+                "PK": "SHOWTIME_CACHE#PROVIDER#gracenote#ZIP#60422#DATE#2026-06-06",
+                "SK": "TITLE#obsession#MOVIE#MV027092280000#THEATER#10017#START#2026-06-06T12:10:00#FORMAT#65461021c233",
+                "provider": "gracenote",
+                "tmsId": "MV027092280000",
+                "title": "Obsession",
+                "normalizedTitle": "obsession",
+                "theatreId": "10017",
+                "theatreName": "AMC Roosevelt Collection 16",
+                "startsAtUtc": "2026-06-06T17:10:00Z",
+                "localDateTime": "2026-06-06T12:10:00",
+                "radius": 30,
+                "units": "mi",
+            }
+        )
+
+        result = self.app.handler(
+            {
+                "httpMethod": "GET",
+                "path": "/admin/showtimes/gracenote/search",
+                "queryStringParameters": {
+                    "title": "Obsession",
+                    "zip": "60422",
+                    "radius": "30",
+                    "numDays": "3",
+                    "units": "mi",
+                    "startDate": "2026-06-05",
+                },
+                "requestContext": {
+                    "httpMethod": "GET",
+                    "resourcePath": "/admin/showtimes/gracenote/search",
+                },
+            },
+            None,
+        )
+
+        self.assertEqual(200, result["statusCode"])
+        showtimes = json.loads(result["body"])["showtimes"]
+        self.assertEqual(1, len(showtimes))
+        queried_pks = [query[0].conditions[0][2] for query in self.fake_table.queries]
+        self.assertEqual(
+            [
+                "SHOWTIME_CACHE#PROVIDER#gracenote#ZIP#60422#DATE#2026-06-05",
+                "SHOWTIME_CACHE#PROVIDER#gracenote#ZIP#60422#DATE#2026-06-06",
+                "SHOWTIME_CACHE#PROVIDER#gracenote#ZIP#60422#DATE#2026-06-07",
+            ],
+            queried_pks,
+        )
+
+    def test_query_cache_date_paginates_until_limit_is_collected(self):
+        search = {
+            "zip": "60422",
+            "startDate": "2026-06-05",
+            "normalizedTitle": "obsession",
+            "radius": 30,
+            "units": "mi",
+        }
+        self.fake_table.page_size = 1
+        for index in range(3):
+            self.fake_table.items.append(
+                {
+                    "PK": "SHOWTIME_CACHE#PROVIDER#gracenote#ZIP#60422#DATE#2026-06-05",
+                    "SK": f"TITLE#obsession#MOVIE#MV027092280000#THEATER#{index}#START#2026-06-05T12:1{index}:00#FORMAT#abc",
+                    "normalizedTitle": "obsession",
+                    "startsAtUtc": f"2026-06-05T17:1{index}:00Z",
+                    "radius": 30,
+                    "units": "mi",
+                }
+            )
+
+        items = self.app.query_cache_date(search, "2026-06-05", 2)
+
+        self.assertEqual(2, len(items))
+        self.assertEqual(2, len(self.fake_table.queries))
+        self.assertEqual(2, self.fake_table.queries[0][1]["Limit"])
+        self.assertEqual(1, self.fake_table.queries[1][1]["Limit"])
+        self.assertIn("ExclusiveStartKey", self.fake_table.queries[1][1])
 
     def test_search_cache_accepts_cached_results_inside_requested_radius(self):
         self.fake_table.items.append(
             {
                 "PK": "SHOWTIME_CACHE#PROVIDER#gracenote#ZIP#60649#DATE#2026-06-04",
-                "SK": "MOVIE#MV027092280000#THEATER#10017#START#2026-06-04T12:10:00#FORMAT#65461021c233",
+                "SK": "TITLE#obsession#MOVIE#MV027092280000#THEATER#10017#START#2026-06-04T12:10:00#FORMAT#65461021c233",
+                "normalizedTitle": "obsession",
                 "provider": "gracenote",
                 "tmsId": "MV027092280000",
                 "rootId": "31406172",

@@ -2,6 +2,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -171,6 +172,11 @@ def qualifier_hash(quals):
     return hashlib.sha256(canonical_json(quals).encode("utf-8")).hexdigest()[:12]
 
 
+def normalize_title(value):
+    normalized = re.sub(r"[^a-z0-9]+", " ", str(value or "").lower())
+    return " ".join(normalized.split())
+
+
 def parse_screen_format(quals):
     text = " ".join(quals) if isinstance(quals, list) else str(quals or "")
     lower = text.lower()
@@ -266,15 +272,17 @@ def normalize_items(response_data, message):
             )
             quals = showtime.get("quals") or []
             q_hash = qualifier_hash(quals)
+            show_date = local_date_time[:10]
+            normalized_title = normalize_title(movie.get("title"))
 
             item = sanitize_item(
                 {
                     "PK": (
                         "SHOWTIME_CACHE#PROVIDER#gracenote"
-                        f"#ZIP#{message['zip']}#DATE#{message['startDate']}"
+                        f"#ZIP#{message['zip']}#DATE#{show_date}"
                     ),
                     "SK": (
-                        f"MOVIE#{tms_id}#THEATER#{theater_id}"
+                        f"TITLE#{normalized_title}#MOVIE#{tms_id}#THEATER#{theater_id}"
                         f"#START#{local_date_time}#FORMAT#{q_hash}"
                     ),
                     "GSI1PK": f"MOVIE#GRACENOTE#{tms_id}",
@@ -283,6 +291,7 @@ def normalize_items(response_data, message):
                     "tmsId": tms_id,
                     "rootId": movie.get("rootId") or "",
                     "title": movie.get("title") or "",
+                    "normalizedTitle": normalized_title,
                     "releaseYear": movie.get("releaseYear") or "",
                     "providerTheaterId": theater_id,
                     "theaterName": theater_name,
@@ -300,7 +309,9 @@ def normalize_items(response_data, message):
                     "runTime": movie.get("runTime"),
                     "preferredImage": movie.get("preferredImage"),
                     "zip": message["zip"],
-                    "startDate": message["startDate"],
+                    "showDate": show_date,
+                    "startDate": show_date,
+                    "requestStartDate": message["startDate"],
                     "radius": message["radius"],
                     "units": message["units"],
                     "qualifierHash": q_hash,

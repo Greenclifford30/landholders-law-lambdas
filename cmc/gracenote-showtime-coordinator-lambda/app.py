@@ -2,7 +2,7 @@ import json
 import logging
 import os
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import boto3
@@ -177,11 +177,20 @@ def resolve_search_request(event):
     }
 
 
-def cache_pk(search):
+def cache_pk(search, show_date=None):
     return (
         "SHOWTIME_CACHE#PROVIDER#gracenote"
-        f"#ZIP#{search['zip']}#DATE#{search['startDate']}"
+        f"#ZIP#{search['zip']}#DATE#{show_date or search['startDate']}"
     )
+
+
+def title_sk_prefix(search):
+    return f"TITLE#{search['normalizedTitle']}#"
+
+
+def date_window(start_date, num_days):
+    first_date = datetime.strptime(start_date, "%Y-%m-%d").date()
+    return [(first_date + timedelta(days=offset)).isoformat() for offset in range(num_days)]
 
 
 def values_equal(left, right):
@@ -198,12 +207,8 @@ def cached_radius_matches(item_radius, requested_radius):
 
 
 def matches_search(item, search):
-    item_title = normalize_title(item.get("title"))
-    requested_title = search["normalizedTitle"]
-    if not item_title or not requested_title:
-        return False
-    title_matches = item_title == requested_title or requested_title in item_title or item_title in requested_title
-    if not title_matches:
+    item_title = item.get("normalizedTitle") or normalize_title(item.get("title"))
+    if item_title != search["normalizedTitle"]:
         return False
     if not cached_radius_matches(item.get("radius"), search["radius"]):
         return False
@@ -230,12 +235,40 @@ def public_cached_showtime(item):
     }
 
 
+def query_cache_date(search, show_date, remaining):
+    items = []
+    last_key = None
+    key_expression = Key("PK").eq(cache_pk(search, show_date)) & Key("SK").begins_with(title_sk_prefix(search))
+
+    while remaining > 0:
+        kwargs = {
+            "KeyConditionExpression": key_expression,
+            "Limit": remaining,
+        }
+        if last_key:
+            kwargs["ExclusiveStartKey"] = last_key
+
+        result = table().query(**kwargs)
+        items.extend(result.get("Items", []))
+        remaining -= len(result.get("Items", []))
+        last_key = result.get("LastEvaluatedKey")
+        if not last_key:
+            break
+
+    return items
+
+
 def search_cached_showtimes(event):
     search = resolve_search_request(event)
-    result = table().query(KeyConditionExpression=Key("PK").eq(cache_pk(search)))
+    items = []
+    for show_date in date_window(search["startDate"], search["numDays"]):
+        if len(items) >= SEARCH_LIMIT:
+            break
+        items.extend(query_cache_date(search, show_date, SEARCH_LIMIT - len(items)))
+
     showtimes = [
         public_cached_showtime(item)
-        for item in result.get("Items", [])
+        for item in items
         if matches_search(item, search) and item.get("startsAtUtc")
     ]
     showtimes.sort(key=lambda item: (item.get("startsAtUtc") or "", item.get("theaterName") or ""))

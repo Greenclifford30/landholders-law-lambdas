@@ -127,7 +127,15 @@ class WorkerTests(unittest.TestCase):
             "SHOWTIME_CACHE#PROVIDER#gracenote#ZIP#60422#DATE#2026-05-28",
             item["PK"],
         )
-        self.assertTrue(item["SK"].startswith("MOVIE#MV0123456789#THEATER#999#START#"))
+        self.assertTrue(
+            item["SK"].startswith(
+                "TITLE#test movie#MOVIE#MV0123456789#THEATER#999#START#"
+            )
+        )
+        self.assertEqual("test movie", item["normalizedTitle"])
+        self.assertEqual("2026-05-28", item["showDate"])
+        self.assertEqual("2026-05-28", item["startDate"])
+        self.assertEqual("2026-05-28", item["requestStartDate"])
         self.assertEqual("MOVIE#GRACENOTE#MV0123456789", item["GSI1PK"])
         self.assertEqual("999", item["providerTheaterId"])
         self.assertEqual("Test Theatre", item["theaterName"])
@@ -135,6 +143,35 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual("Test Theatre", item["theatreName"])
         self.assertEqual("IMAX", item["screenFormat"])
         self.assertIsInstance(item["expiresAt"], int)
+
+    def test_normalize_items_uses_local_show_date_in_cache_pk(self):
+        response = [
+            {
+                "tmsId": "MV0123456789",
+                "title": "Late Movie",
+                "showtimes": [
+                    {
+                        "theatre": {"id": "999", "name": "Test Theatre"},
+                        "dateTime": "2026-05-29T00:30Z",
+                    }
+                ],
+            }
+        ]
+        message = {
+            "zip": "60422",
+            "startDate": "2026-05-29",
+            "radius": 30,
+            "units": "mi",
+        }
+
+        items = self.app.normalize_items(response, message)
+
+        self.assertEqual(
+            "SHOWTIME_CACHE#PROVIDER#gracenote#ZIP#60422#DATE#2026-05-28",
+            items[0]["PK"],
+        )
+        self.assertEqual("2026-05-28", items[0]["showDate"])
+        self.assertEqual("2026-05-29", items[0]["requestStartDate"])
 
     def test_handler_returns_only_retryable_batch_failures(self):
         records = {
