@@ -282,6 +282,22 @@ class MvpHandlerTests(unittest.TestCase):
         self.assertEqual(200, result["statusCode"])
         self.assertEqual("tmdb", body(result)["results"][0]["provider"])
 
+    def test_movie_search_requires_two_character_query(self):
+        app = load_app("movie-search-lambda", self.table)
+        result = app.handler(event(query={"query": "H"}), None)
+        self.assertEqual(400, result["statusCode"])
+
+    def test_now_playing_returns_normalized_tmdb_results(self):
+        app = load_app("movie-search-lambda", self.table)
+        with patch.object(app.requests, "get") as fake_get:
+            fake_get.return_value.status_code = 200
+            fake_get.return_value.json.return_value = {"results": [{"id": 2, "title": "Sinners", "release_date": "2025-04-18"}]}
+            result = app.handler(event(path="/movies/now-playing", query={"page": "2"}), None)
+        self.assertEqual(200, result["statusCode"])
+        self.assertEqual("tmdb", body(result)["results"][0]["provider"])
+        self.assertEqual("/movie/now_playing", fake_get.call_args.args[0].rsplit("/3", 1)[1])
+        self.assertEqual("2", fake_get.call_args.kwargs["params"]["page"])
+
     def test_create_movie_night_requires_admin_and_creates_active_pointer(self):
         app = load_app("create-movie-night-lambda", self.table)
         result = app.handler(
