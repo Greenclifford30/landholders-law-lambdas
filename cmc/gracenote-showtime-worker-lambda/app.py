@@ -256,10 +256,10 @@ def normalize_items(response_data, message):
 
         for showtime in movie.get("showtimes") or []:
             theatre = showtime.get("theatre") or {}
-            theatre_id = theatre.get("id")
-            theatre_name = theatre.get("name")
-            if not theatre_id or not theatre_name:
-                raise NonRetryableError("Showtime is missing theatre id or name.")
+            theater_id = theatre.get("id")
+            theater_name = theatre.get("name")
+            if not theater_id or not theater_name:
+                raise NonRetryableError("Showtime is missing theater id or name.")
 
             local_date_time, starts_at_utc = normalize_datetime(
                 showtime.get("dateTime"), timezone_name
@@ -274,18 +274,21 @@ def normalize_items(response_data, message):
                         f"#ZIP#{message['zip']}#DATE#{message['startDate']}"
                     ),
                     "SK": (
-                        f"MOVIE#{tms_id}#THEATER#{theatre_id}"
+                        f"MOVIE#{tms_id}#THEATER#{theater_id}"
                         f"#START#{local_date_time}#FORMAT#{q_hash}"
                     ),
                     "GSI1PK": f"MOVIE#GRACENOTE#{tms_id}",
-                    "GSI1SK": f"START#{starts_at_utc}#THEATER#{theatre_id}",
+                    "GSI1SK": f"START#{starts_at_utc}#THEATER#{theater_id}",
                     "provider": "gracenote",
                     "tmsId": tms_id,
                     "rootId": movie.get("rootId") or "",
                     "title": movie.get("title") or "",
                     "releaseYear": movie.get("releaseYear") or "",
-                    "theatreId": theatre_id,
-                    "theatreName": theatre_name,
+                    "providerTheaterId": theater_id,
+                    "theaterName": theater_name,
+                    "theaterLocation": theatre.get("location") or theatre.get("address") or "",
+                    "theatreId": theater_id,
+                    "theatreName": theater_name,
                     "localDateTime": local_date_time,
                     "startsAtUtc": starts_at_utc,
                     "quals": quals,

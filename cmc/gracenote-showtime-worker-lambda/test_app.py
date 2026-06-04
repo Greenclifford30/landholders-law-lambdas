@@ -49,10 +49,16 @@ def load_app():
         client=lambda service_name: FakeSecretsClient(),
     )
     fake_botocore_exceptions = types.SimpleNamespace(ClientError=FakeClientError)
+    fake_requests = types.SimpleNamespace(
+        get=lambda *args, **kwargs: None,
+        Timeout=TimeoutError,
+        RequestException=Exception,
+    )
 
     sys.modules["boto3"] = fake_boto3
     sys.modules["botocore"] = types.SimpleNamespace(exceptions=fake_botocore_exceptions)
     sys.modules["botocore.exceptions"] = fake_botocore_exceptions
+    sys.modules["requests"] = fake_requests
 
     module_path = Path(__file__).with_name("app.py")
     spec = importlib.util.spec_from_file_location("worker_app", module_path)
@@ -123,6 +129,10 @@ class WorkerTests(unittest.TestCase):
         )
         self.assertTrue(item["SK"].startswith("MOVIE#MV0123456789#THEATER#999#START#"))
         self.assertEqual("MOVIE#GRACENOTE#MV0123456789", item["GSI1PK"])
+        self.assertEqual("999", item["providerTheaterId"])
+        self.assertEqual("Test Theatre", item["theaterName"])
+        self.assertEqual("999", item["theatreId"])
+        self.assertEqual("Test Theatre", item["theatreName"])
         self.assertEqual("IMAX", item["screenFormat"])
         self.assertIsInstance(item["expiresAt"], int)
 

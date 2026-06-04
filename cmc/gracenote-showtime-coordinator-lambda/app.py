@@ -188,6 +188,15 @@ def values_equal(left, right):
     return str(left) == str(right)
 
 
+def cached_radius_matches(item_radius, requested_radius):
+    if item_radius is None:
+        return True
+    try:
+        return int(item_radius) <= int(requested_radius)
+    except (TypeError, ValueError):
+        return values_equal(item_radius, requested_radius)
+
+
 def matches_search(item, search):
     item_title = normalize_title(item.get("title"))
     requested_title = search["normalizedTitle"]
@@ -196,7 +205,7 @@ def matches_search(item, search):
     title_matches = item_title == requested_title or requested_title in item_title or item_title in requested_title
     if not title_matches:
         return False
-    if item.get("radius") is not None and not values_equal(item.get("radius"), search["radius"]):
+    if not cached_radius_matches(item.get("radius"), search["radius"]):
         return False
     if item.get("units") is not None and item.get("units") != search["units"]:
         return False

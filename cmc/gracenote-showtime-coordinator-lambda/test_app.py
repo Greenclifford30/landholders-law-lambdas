@@ -180,6 +180,72 @@ class CoordinatorTests(unittest.TestCase):
         queried_key = self.fake_table.queries[0][0].conditions[0][2]
         self.assertEqual("SHOWTIME_CACHE#PROVIDER#gracenote#ZIP#60422#DATE#2026-06-05", queried_key)
 
+    def test_search_cache_accepts_cached_results_inside_requested_radius(self):
+        self.fake_table.items.append(
+            {
+                "PK": "SHOWTIME_CACHE#PROVIDER#gracenote#ZIP#60649#DATE#2026-06-04",
+                "SK": "MOVIE#MV027092280000#THEATER#10017#START#2026-06-04T12:10:00#FORMAT#65461021c233",
+                "provider": "gracenote",
+                "tmsId": "MV027092280000",
+                "rootId": "31406172",
+                "title": "Obsession",
+                "theatreId": "10017",
+                "theatreName": "AMC Roosevelt Collection 16",
+                "startsAtUtc": "2026-06-04T17:10:00Z",
+                "localDateTime": "2026-06-04T12:10:00",
+                "screenFormat": "Captioned",
+                "ticketURI": "http://www.fandango.com/tms.asp?t=AAVNK&m=301373&d=2026-06-04",
+                "quals": "Closed Captioned|Descriptive Video Services|Laser Projection|Recliners|Reserved Seating",
+                "radius": 15,
+                "units": "mi",
+            }
+        )
+
+        result = self.app.handler(
+            {
+                "httpMethod": "GET",
+                "path": "/admin/showtimes/gracenote/search",
+                "queryStringParameters": {
+                    "title": "Obsession",
+                    "zip": "60649",
+                    "radius": "30",
+                    "numDays": "14",
+                    "units": "mi",
+                    "startDate": "2026-06-04",
+                },
+                "requestContext": {
+                    "httpMethod": "GET",
+                    "resourcePath": "/admin/showtimes/gracenote/search",
+                },
+            },
+            None,
+        )
+
+        self.assertEqual(200, result["statusCode"])
+        showtimes = json.loads(result["body"])["showtimes"]
+        self.assertEqual(1, len(showtimes))
+        self.assertEqual("AMC Roosevelt Collection 16", showtimes[0]["theaterName"])
+        self.assertEqual("10017", showtimes[0]["providerTheaterId"])
+        self.assertEqual("MV027092280000", showtimes[0]["providerMovieId"])
+
+    def test_search_cache_rejects_cached_results_outside_requested_radius(self):
+        self.assertFalse(
+            self.app.matches_search(
+                {
+                    "title": "Obsession",
+                    "startsAtUtc": "2026-06-04T17:10:00Z",
+                    "radius": 30,
+                    "units": "mi",
+                },
+                {
+                    "title": "Obsession",
+                    "normalizedTitle": "obsession",
+                    "radius": 15,
+                    "units": "mi",
+                },
+            )
+        )
+
     def test_search_cache_requires_title(self):
         result = self.app.handler(
             {
