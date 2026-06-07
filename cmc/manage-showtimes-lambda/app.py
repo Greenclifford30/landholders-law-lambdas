@@ -12,11 +12,13 @@ from cmc_shared import (
     parse_body,
     path_param,
     public_movie_night,
-    put_item,
     require_movie_night_membership,
     response,
     table,
 )
+
+
+CLOSED_STATUSES = {"confirmed", "completed", "cancelled"}
 
 
 def cached_showtime_id(cache_key):
@@ -84,6 +86,9 @@ def handler(event, context):
     movie_night_id = path_param(event, "movieNightId")
     user = claims(event)
     movie_night, _membership = require_movie_night_membership(movie_night_id, user["userId"], ADMIN_ROLES)
+    if movie_night.get("status") in CLOSED_STATUSES:
+        raise ApiError(409, "Showtimes cannot be changed after the movie night is confirmed.")
+
     payload = parse_body(event)
     raw_showtimes = payload.get("showtimes") or []
     cached_keys = payload.get("cachedShowtimeKeys") or []
@@ -95,6 +100,8 @@ def handler(event, context):
     with table().batch_writer(overwrite_by_pkeys=["PK", "SK"]) as batch:
         for item in items:
             batch.put_item(Item=item)
+
+    next_movie_night = {**movie_night, "updatedAt": created_at}
     if movie_night.get("status") == "planning":
         table().update_item(
             Key={"PK": movie_night["PK"], "SK": movie_night["SK"]},
@@ -112,4 +119,16 @@ def handler(event, context):
             ExpressionAttributeNames={"#status": "status"},
             ExpressionAttributeValues={":status": "voting", ":updatedAt": created_at},
         )
-    return response(201, {"showtimes": [public_movie_night(item) for item in items]})
+        next_movie_night = {
+            **next_movie_night,
+            "status": "voting",
+            "GSI1PK": f"CLUB#{movie_night['clubId']}#STATUS#voting",
+        }
+
+    return response(
+        201,
+        {
+            "showtimes": [public_movie_night(item) for item in items],
+            "movieNight": public_movie_night(next_movie_night),
+        },
+    )
