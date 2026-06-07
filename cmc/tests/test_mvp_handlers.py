@@ -549,7 +549,8 @@ class MvpHandlerTests(unittest.TestCase):
         result = app.handler(event("POST", movie_night_id="mn-1", body={"cachedShowtimeKeys": [cache_key]}), None)
 
         self.assertEqual(201, result["statusCode"])
-        imported = body(result)["showtimes"][0]
+        response_body = body(result)
+        imported = response_body["showtimes"][0]
         self.assertEqual("Music Box Theatre", imported["theaterName"])
         self.assertEqual("2026-06-06T00:30:00Z", imported["startsAtUtc"])
         self.assertEqual("MV0123456789", imported["providerMovieId"])
@@ -557,7 +558,59 @@ class MvpHandlerTests(unittest.TestCase):
         self.assertEqual("70mm", imported["screenFormat"])
         self.assertEqual("https://tickets.example", imported["ticketURI"])
         self.assertEqual(["70mm"], imported["quals"])
+        self.assertEqual("voting", response_body["movieNight"]["status"])
         self.assertIn(("MOVIE_NIGHT#mn-1", f"SHOWTIME#{imported['showtimeId']}"), self.table.items)
+
+    def test_manage_showtimes_import_sanitizes_cached_provider_values(self):
+        self.seed_movie_night("planning")
+        cache_key = self.seed_cached_showtime()
+        cached = self.table.items[(cache_key["PK"], cache_key["SK"])]
+        cached["ticketURI"] = None
+        cached["quals"] = [{"name": "premium", "score": 1.0, "extra": None}]
+        app = load_app("manage-showtimes-lambda", self.table)
+        result = app.handler(event("POST", movie_night_id="mn-1", body={"cachedShowtimeKeys": [cache_key]}), None)
+
+        self.assertEqual(201, result["statusCode"])
+        imported = body(result)["showtimes"][0]
+        stored = self.table.items[("MOVIE_NIGHT#mn-1", f"SHOWTIME#{imported['showtimeId']}")]
+        self.assertNotIn("ticketURI", stored)
+        self.assertEqual(Decimal("1.0"), stored["quals"][0]["score"])
+        self.assertNotIn("extra", stored["quals"][0])
+
+    def test_manage_showtimes_opens_voting_and_updates_active_pointer(self):
+        self.seed_movie_night("planning")
+        app = load_app("manage-showtimes-lambda", self.table)
+        result = app.handler(
+            event(
+                "POST",
+                movie_night_id="mn-1",
+                body={"showtimes": [{"showtimeId": "st-1", "theaterName": "Music Box", "startsAtUtc": "2026-06-01T01:00:00Z"}]},
+            ),
+            None,
+        )
+
+        self.assertEqual(201, result["statusCode"])
+        self.assertEqual("voting", body(result)["movieNight"]["status"])
+        self.assertEqual("voting", self.table.items[("CLUB#club-1", "MOVIE_NIGHT#mn-1")]["status"])
+        self.assertEqual("voting", self.table.items[("CLUB#club-1", "ACTIVE_MOVIE_NIGHT")]["status"])
+
+    def test_manage_showtimes_rejects_closed_movie_nights(self):
+        for status in ("confirmed", "completed", "cancelled"):
+            with self.subTest(status=status):
+                self.setUp()
+                self.seed_movie_night(status)
+                app = load_app("manage-showtimes-lambda", self.table)
+                result = app.handler(
+                    event(
+                        "POST",
+                        movie_night_id="mn-1",
+                        body={"showtimes": [{"showtimeId": "st-1", "theaterName": "Music Box", "startsAtUtc": "2026-06-01T01:00:00Z"}]},
+                    ),
+                    None,
+                )
+
+                self.assertEqual(409, result["statusCode"])
+                self.assertNotIn(("MOVIE_NIGHT#mn-1", "SHOWTIME#st-1"), self.table.items)
 
     def test_manage_showtimes_cached_import_is_idempotent(self):
         self.seed_movie_night("planning")
@@ -608,6 +661,20 @@ class MvpHandlerTests(unittest.TestCase):
         result = app.handler(event(movie_night_id="mn-1"), None)
         self.assertEqual(3, body(result)["standings"][0]["points"])
 
+    def test_vote_results_returns_attached_showtimes_with_zero_votes(self):
+        self.seed_movie_night()
+        self.seed_showtime()
+        app = load_app("vote-results-lambda", self.table)
+        result = app.handler(event(movie_night_id="mn-1"), None)
+
+        self.assertEqual(200, result["statusCode"])
+        standings = body(result)["standings"]
+        self.assertEqual(1, len(standings))
+        self.assertEqual("st-1", standings[0]["showtimeId"])
+        self.assertEqual(0, standings[0]["points"])
+        self.assertEqual(0, standings[0]["firstChoiceVotes"])
+        self.assertEqual(0, standings[0]["rankedVotes"])
+
     def test_confirm_showtime_sets_confirmed_status(self):
         self.seed_movie_night()
         self.seed_showtime()
@@ -615,6 +682,16 @@ class MvpHandlerTests(unittest.TestCase):
         result = app.handler(event("POST", movie_night_id="mn-1", body={"showtimeId": "st-1"}), None)
         self.assertEqual(200, result["statusCode"])
         self.assertEqual("confirmed", body(result)["status"])
+
+    def test_confirm_showtime_allows_admin_pick_without_votes(self):
+        self.seed_movie_night("voting")
+        self.seed_showtime()
+        app = load_app("confirm-showtime-lambda", self.table)
+        result = app.handler(event("POST", movie_night_id="mn-1", body={"showtimeId": "st-1"}), None)
+
+        self.assertEqual(200, result["statusCode"])
+        self.assertEqual("confirmed", body(result)["status"])
+        self.assertEqual("confirmed", self.table.items[("CLUB#club-1", "MOVIE_NIGHT#mn-1")]["status"])
 
     def test_update_rsvp_requires_confirmed_movie_night(self):
         self.seed_movie_night("confirmed")

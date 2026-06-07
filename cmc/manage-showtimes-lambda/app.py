@@ -1,4 +1,5 @@
 import hashlib
+from decimal import Decimal
 
 from cmc_shared import (
     ADMIN_ROLES,
@@ -26,13 +27,39 @@ def cached_showtime_id(cache_key):
     return f"st_cache_{hashlib.sha256(raw_key.encode('utf-8')).hexdigest()[:12]}"
 
 
+def dynamodb_value(value):
+    if isinstance(value, float):
+        return Decimal(str(value))
+    if isinstance(value, dict):
+        return {
+            key: sanitized
+            for key, child in value.items()
+            if (sanitized := dynamodb_value(child)) is not None
+        }
+    if isinstance(value, list):
+        return [
+            sanitized
+            for child in value
+            if (sanitized := dynamodb_value(child)) is not None
+        ]
+    return value
+
+
+def sanitize_item(item):
+    return {
+        key: sanitized
+        for key, value in item.items()
+        if (sanitized := dynamodb_value(value)) is not None
+    }
+
+
 def normalize_manual_showtime(movie_night_id, raw, created_at):
     showtime_id = raw.get("showtimeId") or new_id("st")
     starts_at = raw.get("startsAtUtc") or raw.get("startsAt") or raw.get("startTime")
     theater_name = raw.get("theaterName") or raw.get("theatreName")
     if not starts_at or not theater_name:
         raise ApiError(400, "Each showtime requires startsAtUtc and theaterName.")
-    return {
+    return sanitize_item({
         "PK": movie_night_pk(movie_night_id),
         "SK": f"SHOWTIME#{showtime_id}",
         "GSI1PK": f"MOVIE_NIGHT#{movie_night_id}#SHOWTIMES",
@@ -52,7 +79,7 @@ def normalize_manual_showtime(movie_night_id, raw, created_at):
         "quals": raw.get("quals", []),
         "createdAt": created_at,
         "updatedAt": created_at,
-    }
+    })
 
 
 def from_cache(movie_night_id, cache_key, created_at):
