@@ -266,6 +266,59 @@ class MvpHandlerTests(unittest.TestCase):
         self.assertEqual(200, result["statusCode"])
         self.assertEqual("confirmed", body(result)["status"])
 
+    def test_complete_movie_night_sets_completed_status(self):
+        self.seed_movie_night("confirmed")
+        app = load_app("complete-movie-night-lambda", self.table)
+        result = app.handler(event("POST", movie_night_id="mn-1"), None)
+        movie_night = self.table.items[("CLUB#club-1", "MOVIE_NIGHT#mn-1")]
+        pointer = self.table.items[("CLUB#club-1", "ACTIVE_MOVIE_NIGHT")]
+
+        self.assertEqual(200, result["statusCode"])
+        self.assertEqual("completed", body(result)["movieNight"]["status"])
+        self.assertEqual("completed", movie_night["status"])
+        self.assertEqual("CLUB#club-1#STATUS#completed", movie_night["GSI1PK"])
+        self.assertEqual("user-1", movie_night["completedBy"])
+        self.assertIn("completedAt", movie_night)
+        self.assertEqual("completed", pointer["status"])
+
+    def test_complete_movie_night_rejects_non_confirmed_status(self):
+        for status in ("planning", "voting", "completed", "cancelled"):
+            with self.subTest(status=status):
+                self.table = FakeTable()
+                self.table.put_item(Item={"PK": "CLUB#club-1", "SK": "MEMBER#user-1", "role": "admin"})
+                self.table.put_item(Item={"PK": "CLUB#club-1", "SK": "MEMBER#user-2", "role": "friend"})
+                self.seed_movie_night(status)
+                app = load_app("complete-movie-night-lambda", self.table)
+                result = app.handler(event("POST", movie_night_id="mn-1"), None)
+                self.assertEqual(409, result["statusCode"])
+
+    def test_complete_movie_night_requires_admin(self):
+        self.seed_movie_night("confirmed")
+        app = load_app("complete-movie-night-lambda", self.table)
+        result = app.handler(event("POST", movie_night_id="mn-1", user_id="user-2"), None)
+        self.assertEqual(403, result["statusCode"])
+
+    def test_create_movie_night_allowed_after_completion(self):
+        self.seed_movie_night("confirmed")
+        complete_app = load_app("complete-movie-night-lambda", self.table)
+        complete_result = complete_app.handler(event("POST", movie_night_id="mn-1"), None)
+        self.assertEqual(200, complete_result["statusCode"])
+
+        create_app = load_app("create-movie-night-lambda", self.table)
+        create_result = create_app.handler(
+            event(
+                "POST",
+                club_id="club-1",
+                body={"targetDate": "2026-07-01", "movie": {"externalId": "2", "title": "Thief"}},
+            ),
+            None,
+        )
+        movie_night_id = body(create_result)["movieNight"]["movieNightId"]
+
+        self.assertEqual(201, create_result["statusCode"])
+        self.assertEqual(movie_night_id, self.table.items[("CLUB#club-1", "ACTIVE_MOVIE_NIGHT")]["movieNightId"])
+        self.assertEqual("planning", self.table.items[("CLUB#club-1", "ACTIVE_MOVIE_NIGHT")]["status"])
+
     def test_update_rsvp_requires_confirmed_movie_night(self):
         self.seed_movie_night("confirmed")
         app = load_app("update-rsvp-lambda", self.table)
@@ -277,6 +330,17 @@ class MvpHandlerTests(unittest.TestCase):
         app = load_app("list-history-lambda", self.table)
         result = app.handler(event(club_id="club-1"), None)
         self.assertEqual(1, len(body(result)["movieNights"]))
+
+    def test_list_history_returns_completed_nights(self):
+        self.seed_movie_night("confirmed")
+        complete_app = load_app("complete-movie-night-lambda", self.table)
+        complete_result = complete_app.handler(event("POST", movie_night_id="mn-1"), None)
+        self.assertEqual(200, complete_result["statusCode"])
+
+        history_app = load_app("list-history-lambda", self.table)
+        result = history_app.handler(event(club_id="club-1"), None)
+        self.assertEqual(1, len(body(result)["movieNights"]))
+        self.assertEqual("completed", body(result)["movieNights"][0]["status"])
 
 
 if __name__ == "__main__":
