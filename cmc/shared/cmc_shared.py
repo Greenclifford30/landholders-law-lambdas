@@ -2,7 +2,7 @@ import json
 import logging
 import os
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 import boto3
@@ -257,6 +257,17 @@ def list_showtimes(movie_night_id):
     return query_items(movie_night_pk(movie_night_id), "SHOWTIME#")
 
 
+def list_showtimes_by_status(movie_night_id, allowed_statuses=None):
+    showtimes = list_showtimes(movie_night_id)
+    if allowed_statuses is None:
+        return showtimes
+    return [
+        item
+        for item in showtimes
+        if item.get("status", "approved") in allowed_statuses
+    ]
+
+
 def list_votes(movie_night_id):
     return query_items(movie_night_pk(movie_night_id), "VOTE#")
 
@@ -270,6 +281,76 @@ def require_string(payload, name):
     if not isinstance(value, str) or not value.strip():
         raise ApiError(400, f"{name} is required.")
     return value.strip()
+
+
+def validate_date(value, name):
+    if not isinstance(value, str) or not value.strip():
+        raise ApiError(400, f"{name} is required.")
+    try:
+        datetime.strptime(value.strip(), "%Y-%m-%d")
+    except ValueError as exc:
+        raise ApiError(400, f"{name} must use yyyy-mm-dd format.") from exc
+    return value.strip()
+
+
+def expand_date_window(start_date, end_date):
+    start = datetime.strptime(validate_date(start_date, "dateWindowStart"), "%Y-%m-%d").date()
+    end = datetime.strptime(validate_date(end_date, "dateWindowEnd"), "%Y-%m-%d").date()
+    if end < start:
+        raise ApiError(400, "dateWindowEnd must be on or after dateWindowStart.")
+    if (end - start).days > 30:
+        raise ApiError(400, "Date windows cannot exceed 31 days.")
+    return [(start + timedelta(days=offset)).isoformat() for offset in range((end - start).days + 1)]
+
+
+def normalize_planning_input(payload, existing=None):
+    existing = existing or {}
+    target_date = payload.get("targetDate", existing.get("targetDate"))
+    if target_date:
+        target_date = validate_date(target_date, "targetDate")
+
+    date_window_start = payload.get("dateWindowStart", existing.get("dateWindowStart") or target_date)
+    date_window_end = payload.get("dateWindowEnd", existing.get("dateWindowEnd") or target_date)
+    if date_window_start:
+        date_window_start = validate_date(date_window_start, "dateWindowStart")
+    if date_window_end:
+        date_window_end = validate_date(date_window_end, "dateWindowEnd")
+    if date_window_start and date_window_end:
+        expand_date_window(date_window_start, date_window_end)
+
+    zip_code = str(payload.get("zipCode", payload.get("zip", existing.get("zipCode", "")))).strip()
+    radius_value = payload.get("radiusMiles", payload.get("radius", existing.get("radiusMiles")))
+    radius_miles = None
+    if radius_value not in (None, ""):
+        try:
+            radius_miles = int(radius_value)
+        except (TypeError, ValueError) as exc:
+            raise ApiError(400, "radiusMiles must be an integer.") from exc
+        if radius_miles < 1 or radius_miles > 100:
+            raise ApiError(400, "radiusMiles must be between 1 and 100.")
+
+    preferred_formats = payload.get("preferredFormats", existing.get("preferredFormats", []))
+    if preferred_formats is None:
+        preferred_formats = []
+    if not isinstance(preferred_formats, list):
+        raise ApiError(400, "preferredFormats must be a list.")
+
+    preferred_theater_ids = payload.get("preferredTheaterIds", existing.get("preferredTheaterIds", []))
+    if preferred_theater_ids is None:
+        preferred_theater_ids = []
+    if not isinstance(preferred_theater_ids, list):
+        raise ApiError(400, "preferredTheaterIds must be a list.")
+
+    return {
+        "targetDate": target_date,
+        "dateWindowStart": date_window_start,
+        "dateWindowEnd": date_window_end,
+        "zipCode": zip_code,
+        "radiusMiles": radius_miles,
+        "timezone": str(payload.get("timezone", existing.get("timezone", "America/Chicago"))).strip() or "America/Chicago",
+        "preferredFormats": [str(item).strip() for item in preferred_formats if str(item).strip()],
+        "preferredTheaterIds": [str(item).strip() for item in preferred_theater_ids if str(item).strip()],
+    }
 
 
 def optional_string(payload, name, default=""):

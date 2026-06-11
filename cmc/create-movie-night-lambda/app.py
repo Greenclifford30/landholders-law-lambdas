@@ -1,6 +1,4 @@
 from botocore.exceptions import ClientError
-from datetime import datetime
-
 from cmc_shared import (
     ADMIN_ROLES,
     ApiError,
@@ -8,12 +6,12 @@ from cmc_shared import (
     club_pk,
     handle,
     new_id,
+    normalize_planning_input,
     normalize_movie_snapshot,
     now_iso,
     parse_body,
     path_param,
     require_membership,
-    require_string,
     response,
     transact_put_items,
 )
@@ -26,11 +24,10 @@ def handler(event, context):
     require_membership(club_id, user["userId"], ADMIN_ROLES)
     payload = parse_body(event)
     movie = normalize_movie_snapshot(payload)
-    target_date = require_string(payload, "targetDate")
-    try:
-        datetime.strptime(target_date, "%Y-%m-%d")
-    except ValueError as exc:
-        raise ApiError(400, "targetDate must use yyyy-mm-dd format.") from exc
+    planning = normalize_planning_input(payload)
+    target_date = planning.get("targetDate")
+    if not target_date:
+        raise ApiError(400, "targetDate is required.")
 
     movie_night_id = payload.get("movieNightId") or new_id("mn")
     created_at = now_iso()
@@ -46,7 +43,9 @@ def handler(event, context):
         "status": "planning",
         "movieSelectionMode": payload.get("movieSelectionMode", "admin_selected"),
         "movie": movie,
-        "targetDate": target_date,
+        **planning,
+        "showtimeImportStatus": "idle",
+        "lastShowtimeImportSummary": {},
         "createdAt": created_at,
         "createdBy": user["userId"],
         "updatedAt": created_at,

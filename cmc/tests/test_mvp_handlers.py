@@ -384,6 +384,11 @@ class MvpHandlerTests(unittest.TestCase):
         stored_movie = self.table.items[("CLUB#club-1", f"MOVIE_NIGHT#{movie_night_id}")]["movie"]
         self.assertEqual(Decimal("8.5"), stored_movie["rating"])
         self.assertEqual(Decimal("123.4"), stored_movie["popularity"])
+        stored_night = self.table.items[("CLUB#club-1", f"MOVIE_NIGHT#{movie_night_id}")]
+        self.assertEqual("2026-06-01", stored_night["dateWindowStart"])
+        self.assertEqual("2026-06-01", stored_night["dateWindowEnd"])
+        self.assertEqual("America/Chicago", stored_night["timezone"])
+        self.assertEqual("idle", stored_night["showtimeImportStatus"])
 
     def test_create_movie_night_duplicate_id_returns_conflict(self):
         self.table.put_item(
@@ -491,6 +496,11 @@ class MvpHandlerTests(unittest.TestCase):
             "movieNightId": "mn-1",
             "status": status,
             "targetDate": "2026-06-01",
+            "dateWindowStart": "2026-06-01",
+            "dateWindowEnd": "2026-06-03",
+            "zipCode": "60422",
+            "radiusMiles": 30,
+            "timezone": "America/Chicago",
             "movie": {"title": "Heat"},
         }
         self.table.put_item(Item=item)
@@ -505,6 +515,7 @@ class MvpHandlerTests(unittest.TestCase):
                 "movieNightId": "mn-1",
                 "theaterName": "Music Box",
                 "startsAtUtc": "2026-06-01T01:00:00Z",
+                "status": "approved",
             }
         )
 
@@ -558,7 +569,8 @@ class MvpHandlerTests(unittest.TestCase):
         self.assertEqual("70mm", imported["screenFormat"])
         self.assertEqual("https://tickets.example", imported["ticketURI"])
         self.assertEqual(["70mm"], imported["quals"])
-        self.assertEqual("voting", response_body["movieNight"]["status"])
+        self.assertEqual("approved", imported["status"])
+        self.assertEqual("planning", response_body["movieNight"]["status"])
         self.assertIn(("MOVIE_NIGHT#mn-1", f"SHOWTIME#{imported['showtimeId']}"), self.table.items)
 
     def test_manage_showtimes_import_sanitizes_cached_provider_values(self):
@@ -577,22 +589,117 @@ class MvpHandlerTests(unittest.TestCase):
         self.assertEqual(Decimal("1.0"), stored["quals"][0]["score"])
         self.assertNotIn("extra", stored["quals"][0])
 
-    def test_manage_showtimes_opens_voting_and_updates_active_pointer(self):
+    def test_manage_showtimes_open_voting_updates_active_pointer(self):
+        self.seed_movie_night("planning")
+        self.seed_showtime()
+        self.table.put_item(
+            Item={
+                "PK": "MOVIE_NIGHT#mn-1",
+                "SK": "SHOWTIME#st-2",
+                "showtimeId": "st-2",
+                "movieNightId": "mn-1",
+                "theaterName": "Music Box",
+                "startsAtUtc": "2026-06-01T03:00:00Z",
+                "status": "approved",
+            }
+        )
+        app = load_app("manage-showtimes-lambda", self.table)
+        result = app.handler(event("POST", movie_night_id="mn-1", body={"action": "openVoting"}), None)
+
+        self.assertEqual(200, result["statusCode"])
+        self.assertEqual("voting", body(result)["movieNight"]["status"])
+        self.assertEqual("voting", self.table.items[("CLUB#club-1", "MOVIE_NIGHT#mn-1")]["status"])
+        self.assertEqual("voting", self.table.items[("CLUB#club-1", "ACTIVE_MOVIE_NIGHT")]["status"])
+
+    def test_manage_showtimes_open_voting_requires_two_approved(self):
+        self.seed_movie_night("planning")
+        self.seed_showtime()
+        app = load_app("manage-showtimes-lambda", self.table)
+        result = app.handler(event("POST", movie_night_id="mn-1", body={"action": "openVoting"}), None)
+
+        self.assertEqual(400, result["statusCode"])
+
+    def test_manage_showtimes_updates_planning(self):
         self.seed_movie_night("planning")
         app = load_app("manage-showtimes-lambda", self.table)
         result = app.handler(
             event(
                 "POST",
                 movie_night_id="mn-1",
-                body={"showtimes": [{"showtimeId": "st-1", "theaterName": "Music Box", "startsAtUtc": "2026-06-01T01:00:00Z"}]},
+                body={
+                    "action": "updatePlanning",
+                    "targetDate": "2026-06-05",
+                    "dateWindowStart": "2026-06-04",
+                    "dateWindowEnd": "2026-06-07",
+                    "zipCode": "60613",
+                    "radiusMiles": 20,
+                    "preferredFormats": ["IMAX"],
+                },
             ),
             None,
         )
 
-        self.assertEqual(201, result["statusCode"])
-        self.assertEqual("voting", body(result)["movieNight"]["status"])
-        self.assertEqual("voting", self.table.items[("CLUB#club-1", "MOVIE_NIGHT#mn-1")]["status"])
-        self.assertEqual("voting", self.table.items[("CLUB#club-1", "ACTIVE_MOVIE_NIGHT")]["status"])
+        self.assertEqual(200, result["statusCode"])
+        movie_night = self.table.items[("CLUB#club-1", "MOVIE_NIGHT#mn-1")]
+        self.assertEqual("2026-06-04", movie_night["dateWindowStart"])
+        self.assertEqual("2026-06-07", movie_night["dateWindowEnd"])
+        self.assertEqual("60613", movie_night["zipCode"])
+        self.assertEqual(["IMAX"], movie_night["preferredFormats"])
+
+    def test_manage_showtimes_imports_saved_date_window_idempotently(self):
+        self.seed_movie_night("planning")
+        self.table.items[("CLUB#club-1", "MOVIE_NIGHT#mn-1")]["dateWindowStart"] = "2026-06-05"
+        self.table.items[("CLUB#club-1", "MOVIE_NIGHT#mn-1")]["dateWindowEnd"] = "2026-06-06"
+        first_key = self.seed_cached_showtime()
+        second_key = {
+            "PK": "SHOWTIME_CACHE#PROVIDER#gracenote#ZIP#60422#DATE#2026-06-06",
+            "SK": "TITLE#heat#MOVIE#MV0123456789#THEATER#999#START#2026-06-06T19:30:00#FORMAT#def",
+        }
+        self.table.put_item(
+            Item={
+                **second_key,
+                "provider": "gracenote",
+                "tmsId": "MV0123456789",
+                "title": "Heat",
+                "theatreId": "999",
+                "theatreName": "Music Box Theatre",
+                "startsAtUtc": "2026-06-07T00:30:00Z",
+                "localDateTime": "2026-06-06T19:30:00",
+                "screenFormat": "Standard",
+            }
+        )
+        # Match the current cache key prefix used by imported Gracenote records.
+        cached = self.table.items.pop((first_key["PK"], first_key["SK"]))
+        fixed_first_key = {
+            "PK": first_key["PK"],
+            "SK": "TITLE#heat#MOVIE#MV0123456789#THEATER#999#START#2026-06-05T19:30:00#FORMAT#abc",
+        }
+        self.table.put_item(Item={**cached, **fixed_first_key})
+
+        app = load_app("manage-showtimes-lambda", self.table)
+        first = app.handler(event("POST", movie_night_id="mn-1", body={"action": "import"}), None)
+        second = app.handler(event("POST", movie_night_id="mn-1", body={"action": "import"}), None)
+
+        self.assertEqual(200, first["statusCode"])
+        self.assertEqual(200, second["statusCode"])
+        self.assertEqual(2, body(first)["importJob"]["importedCount"])
+        self.assertEqual(0, body(first)["importJob"]["duplicateCount"])
+        self.assertEqual(0, body(second)["importJob"]["importedCount"])
+        self.assertEqual(2, body(second)["importJob"]["duplicateCount"])
+        movie_night = self.table.items[("CLUB#club-1", "MOVIE_NIGHT#mn-1")]
+        self.assertEqual("completed", movie_night["showtimeImportStatus"])
+        self.assertEqual(["2026-06-05", "2026-06-06"], movie_night["lastShowtimeImportSummary"]["requestedDates"])
+
+    def test_manage_showtimes_approve_and_reject_candidates(self):
+        self.seed_movie_night("planning")
+        self.seed_showtime()
+        self.table.items[("MOVIE_NIGHT#mn-1", "SHOWTIME#st-1")]["status"] = "imported"
+        app = load_app("manage-showtimes-lambda", self.table)
+        approved = app.handler(event("POST", movie_night_id="mn-1", body={"action": "approve", "showtimeId": "st-1"}), None)
+        rejected = app.handler(event("POST", movie_night_id="mn-1", body={"action": "reject", "showtimeId": "st-1"}), None)
+
+        self.assertEqual("approved", body(approved)["showtime"]["status"])
+        self.assertEqual("rejected", body(rejected)["showtime"]["status"])
 
     def test_manage_showtimes_rejects_closed_movie_nights(self):
         for status in ("confirmed", "completed", "cancelled"):
@@ -651,6 +758,14 @@ class MvpHandlerTests(unittest.TestCase):
         self.seed_showtime()
         app = load_app("submit-vote-lambda", self.table)
         result = app.handler(event("PUT", movie_night_id="mn-1", body={"rankings": ["st-1", "st-1"]}), None)
+        self.assertEqual(400, result["statusCode"])
+
+    def test_submit_vote_rejects_unapproved_showtime(self):
+        self.seed_movie_night()
+        self.seed_showtime()
+        self.table.items[("MOVIE_NIGHT#mn-1", "SHOWTIME#st-1")]["status"] = "imported"
+        app = load_app("submit-vote-lambda", self.table)
+        result = app.handler(event("PUT", movie_night_id="mn-1", body={"rankings": ["st-1"]}), None)
         self.assertEqual(400, result["statusCode"])
 
     def test_vote_results_scores_ranked_votes(self):

@@ -51,10 +51,13 @@ def tmdb_get(path, params):
     return result.json()
 
 
-def normalize_movie(movie):
+def normalize_movie(movie, status=None):
     release_date = movie.get("release_date") or ""
     poster_path = movie.get("poster_path") or ""
+    normalized_status = status or ""
     return {
+        "externalProvider": "tmdb",
+        "externalMovieId": str(movie.get("id")),
         "provider": "tmdb",
         "externalId": str(movie.get("id")),
         "title": movie.get("title") or movie.get("name") or "",
@@ -67,6 +70,8 @@ def normalize_movie(movie):
         "genres": movie.get("genres") or movie.get("genre_ids") or [],
         "rating": movie.get("vote_average"),
         "popularity": movie.get("popularity"),
+        "status": normalized_status,
+        "metadataSnapshot": movie,
     }
 
 
@@ -75,13 +80,32 @@ def is_now_playing_request(event):
     return path.rstrip("/").endswith("/movies/now-playing")
 
 
+def is_discovery_request(event):
+    path = event.get("path") or event.get("resourcePath") or ""
+    return path.rstrip("/").endswith("/movies/discover")
+
+
 @handle
 def handler(event, context):
     claims(event)
     page = query_param(event, "page", "1")
     if is_now_playing_request(event):
-        data = tmdb_get("/movie/now_playing", {"page": page})
-        return response(200, {"results": [normalize_movie(movie) for movie in data.get("results", [])]})
+        mode = query_param(event, "mode", "now-playing")
+        if mode not in {"now-playing", "coming-soon"}:
+            raise ApiError(400, "mode must be now-playing or coming-soon.")
+        endpoint = "/movie/now_playing" if mode == "now-playing" else "/movie/upcoming"
+        status = "now_playing" if mode == "now-playing" else "coming_soon"
+        data = tmdb_get(endpoint, {"page": page})
+        return response(200, {"results": [normalize_movie(movie, status) for movie in data.get("results", [])]})
+
+    if is_discovery_request(event):
+        mode = query_param(event, "mode", "now-playing")
+        if mode not in {"now-playing", "coming-soon"}:
+            raise ApiError(400, "mode must be now-playing or coming-soon.")
+        endpoint = "/movie/now_playing" if mode == "now-playing" else "/movie/upcoming"
+        status = "now_playing" if mode == "now-playing" else "coming_soon"
+        data = tmdb_get(endpoint, {"page": page})
+        return response(200, {"results": [normalize_movie(movie, status) for movie in data.get("results", [])]})
 
     query = query_param(event, "query") or query_param(event, "q")
     if not query or len(query.strip()) < 2:

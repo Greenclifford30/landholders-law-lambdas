@@ -22,6 +22,8 @@ def handler(event, context):
     movie_night_id = path_param(event, "movieNightId")
     user = claims(event)
     movie_night, _membership = require_movie_night_membership(movie_night_id, user["userId"])
+    if movie_night.get("status") != "voting":
+        raise ApiError(409, "Voting is not open for this movie night.")
     if movie_night.get("status") in CLOSED_STATUSES:
         raise ApiError(409, "Voting is closed for this movie night.")
     voting_closes_at = movie_night.get("votingClosesAt")
@@ -36,8 +38,11 @@ def handler(event, context):
     if len(ranked_ids) != len(rankings) or len(set(ranked_ids)) != len(ranked_ids):
         raise ApiError(400, "rankings must not contain blank or duplicate showtime IDs.")
     for showtime_id in ranked_ids:
-        if not get_showtime(movie_night_id, showtime_id):
+        showtime = get_showtime(movie_night_id, showtime_id)
+        if not showtime:
             raise ApiError(400, f"Showtime {showtime_id} is not attached to this movie night.")
+        if showtime.get("status", "approved") != "approved":
+            raise ApiError(400, f"Showtime {showtime_id} is not approved for voting.")
 
     saved_at = now_iso()
     item = {

@@ -26,6 +26,8 @@ def handler(event, context):
     showtime = get_showtime(movie_night_id, str(showtime_id))
     if not showtime:
         raise ApiError(400, "Selected showtime is not attached to this movie night.")
+    if showtime.get("status", "approved") != "approved":
+        raise ApiError(400, "Selected showtime is not approved for voting.")
     updated_at = now_iso()
     confirmed_snapshot = public_movie_night(showtime)
     table().update_item(

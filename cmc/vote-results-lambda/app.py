@@ -1,7 +1,7 @@
 from cmc_shared import (
     claims,
     handle,
-    list_showtimes,
+    list_showtimes_by_status,
     list_votes,
     path_param,
     public_movie_night,
@@ -18,7 +18,7 @@ def handler(event, context):
     movie_night_id = path_param(event, "movieNightId")
     user = claims(event)
     require_movie_night_membership(movie_night_id, user["userId"])
-    showtimes = {item["showtimeId"]: item for item in list_showtimes(movie_night_id)}
+    showtimes = {item["showtimeId"]: item for item in list_showtimes_by_status(movie_night_id, {"approved"})}
     totals = {
         showtime_id: {
             "showtimeId": showtime_id,
