@@ -2,6 +2,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -171,6 +172,11 @@ def qualifier_hash(quals):
     return hashlib.sha256(canonical_json(quals).encode("utf-8")).hexdigest()[:12]
 
 
+def normalize_title(value):
+    normalized = re.sub(r"[^a-z0-9]+", " ", str(value or "").lower())
+    return " ".join(normalized.split())
+
+
 def parse_screen_format(quals):
     text = " ".join(quals) if isinstance(quals, list) else str(quals or "")
     lower = text.lower()
@@ -256,36 +262,42 @@ def normalize_items(response_data, message):
 
         for showtime in movie.get("showtimes") or []:
             theatre = showtime.get("theatre") or {}
-            theatre_id = theatre.get("id")
-            theatre_name = theatre.get("name")
-            if not theatre_id or not theatre_name:
-                raise NonRetryableError("Showtime is missing theatre id or name.")
+            theater_id = theatre.get("id")
+            theater_name = theatre.get("name")
+            if not theater_id or not theater_name:
+                raise NonRetryableError("Showtime is missing theater id or name.")
 
             local_date_time, starts_at_utc = normalize_datetime(
                 showtime.get("dateTime"), timezone_name
             )
             quals = showtime.get("quals") or []
             q_hash = qualifier_hash(quals)
+            show_date = local_date_time[:10]
+            normalized_title = normalize_title(movie.get("title"))
 
             item = sanitize_item(
                 {
                     "PK": (
                         "SHOWTIME_CACHE#PROVIDER#gracenote"
-                        f"#ZIP#{message['zip']}#DATE#{message['startDate']}"
+                        f"#ZIP#{message['zip']}#DATE#{show_date}"
                     ),
                     "SK": (
-                        f"MOVIE#{tms_id}#THEATER#{theatre_id}"
+                        f"TITLE#{normalized_title}#MOVIE#{tms_id}#THEATER#{theater_id}"
                         f"#START#{local_date_time}#FORMAT#{q_hash}"
                     ),
                     "GSI1PK": f"MOVIE#GRACENOTE#{tms_id}",
-                    "GSI1SK": f"START#{starts_at_utc}#THEATER#{theatre_id}",
+                    "GSI1SK": f"START#{starts_at_utc}#THEATER#{theater_id}",
                     "provider": "gracenote",
                     "tmsId": tms_id,
                     "rootId": movie.get("rootId") or "",
                     "title": movie.get("title") or "",
+                    "normalizedTitle": normalized_title,
                     "releaseYear": movie.get("releaseYear") or "",
-                    "theatreId": theatre_id,
-                    "theatreName": theatre_name,
+                    "providerTheaterId": theater_id,
+                    "theaterName": theater_name,
+                    "theaterLocation": theatre.get("location") or theatre.get("address") or "",
+                    "theatreId": theater_id,
+                    "theatreName": theater_name,
                     "localDateTime": local_date_time,
                     "startsAtUtc": starts_at_utc,
                     "quals": quals,
@@ -297,7 +309,9 @@ def normalize_items(response_data, message):
                     "runTime": movie.get("runTime"),
                     "preferredImage": movie.get("preferredImage"),
                     "zip": message["zip"],
-                    "startDate": message["startDate"],
+                    "showDate": show_date,
+                    "startDate": show_date,
+                    "requestStartDate": message["startDate"],
                     "radius": message["radius"],
                     "units": message["units"],
                     "qualifierHash": q_hash,

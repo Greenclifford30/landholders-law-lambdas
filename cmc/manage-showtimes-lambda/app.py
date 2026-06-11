@@ -1,3 +1,6 @@
+import hashlib
+from decimal import Decimal
+
 from cmc_shared import (
     ADMIN_ROLES,
     ApiError,
@@ -10,11 +13,44 @@ from cmc_shared import (
     parse_body,
     path_param,
     public_movie_night,
-    put_item,
     require_movie_night_membership,
     response,
     table,
 )
+
+
+CLOSED_STATUSES = {"confirmed", "completed", "cancelled"}
+
+
+def cached_showtime_id(cache_key):
+    raw_key = f"{cache_key['PK']}#{cache_key['SK']}"
+    return f"st_cache_{hashlib.sha256(raw_key.encode('utf-8')).hexdigest()[:12]}"
+
+
+def dynamodb_value(value):
+    if isinstance(value, float):
+        return Decimal(str(value))
+    if isinstance(value, dict):
+        return {
+            key: sanitized
+            for key, child in value.items()
+            if (sanitized := dynamodb_value(child)) is not None
+        }
+    if isinstance(value, list):
+        return [
+            sanitized
+            for child in value
+            if (sanitized := dynamodb_value(child)) is not None
+        ]
+    return value
+
+
+def sanitize_item(item):
+    return {
+        key: sanitized
+        for key, value in item.items()
+        if (sanitized := dynamodb_value(value)) is not None
+    }
 
 
 def normalize_manual_showtime(movie_night_id, raw, created_at):
@@ -23,7 +59,7 @@ def normalize_manual_showtime(movie_night_id, raw, created_at):
     theater_name = raw.get("theaterName") or raw.get("theatreName")
     if not starts_at or not theater_name:
         raise ApiError(400, "Each showtime requires startsAtUtc and theaterName.")
-    return {
+    return sanitize_item({
         "PK": movie_night_pk(movie_night_id),
         "SK": f"SHOWTIME#{showtime_id}",
         "GSI1PK": f"MOVIE_NIGHT#{movie_night_id}#SHOWTIMES",
@@ -43,7 +79,7 @@ def normalize_manual_showtime(movie_night_id, raw, created_at):
         "quals": raw.get("quals", []),
         "createdAt": created_at,
         "updatedAt": created_at,
-    }
+    })
 
 
 def from_cache(movie_night_id, cache_key, created_at):
@@ -55,11 +91,13 @@ def from_cache(movie_night_id, cache_key, created_at):
     return normalize_manual_showtime(
         movie_night_id,
         {
+            "showtimeId": cached_showtime_id(cache_key),
             "provider": cached.get("provider", "gracenote"),
-            "providerShowtimeId": cached.get("SK"),
-            "providerMovieId": cached.get("tmsId") or cached.get("rootId"),
-            "providerTheaterId": cached.get("theatreId"),
-            "theaterName": cached.get("theatreName"),
+            "providerShowtimeId": cached.get("providerShowtimeId") or cached.get("SK"),
+            "providerMovieId": cached.get("providerMovieId") or cached.get("tmsId") or cached.get("rootId"),
+            "providerTheaterId": cached.get("providerTheaterId") or cached.get("theatreId"),
+            "theaterName": cached.get("theaterName") or cached.get("theatreName"),
+            "theaterLocation": cached.get("theaterLocation") or cached.get("theatreLocation", ""),
             "startsAtUtc": cached.get("startsAtUtc"),
             "localDateTime": cached.get("localDateTime"),
             "screenFormat": cached.get("screenFormat", "Standard"),
@@ -75,6 +113,9 @@ def handler(event, context):
     movie_night_id = path_param(event, "movieNightId")
     user = claims(event)
     movie_night, _membership = require_movie_night_membership(movie_night_id, user["userId"], ADMIN_ROLES)
+    if movie_night.get("status") in CLOSED_STATUSES:
+        raise ApiError(409, "Showtimes cannot be changed after the movie night is confirmed.")
+
     payload = parse_body(event)
     raw_showtimes = payload.get("showtimes") or []
     cached_keys = payload.get("cachedShowtimeKeys") or []
@@ -86,6 +127,8 @@ def handler(event, context):
     with table().batch_writer(overwrite_by_pkeys=["PK", "SK"]) as batch:
         for item in items:
             batch.put_item(Item=item)
+
+    next_movie_night = {**movie_night, "updatedAt": created_at}
     if movie_night.get("status") == "planning":
         table().update_item(
             Key={"PK": movie_night["PK"], "SK": movie_night["SK"]},
@@ -103,4 +146,16 @@ def handler(event, context):
             ExpressionAttributeNames={"#status": "status"},
             ExpressionAttributeValues={":status": "voting", ":updatedAt": created_at},
         )
-    return response(201, {"showtimes": [public_movie_night(item) for item in items]})
+        next_movie_night = {
+            **next_movie_night,
+            "status": "voting",
+            "GSI1PK": f"CLUB#{movie_night['clubId']}#STATUS#voting",
+        }
+
+    return response(
+        201,
+        {
+            "showtimes": [public_movie_night(item) for item in items],
+            "movieNight": public_movie_night(next_movie_night),
+        },
+    )

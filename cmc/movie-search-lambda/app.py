@@ -70,12 +70,21 @@ def normalize_movie(movie):
     }
 
 
+def is_now_playing_request(event):
+    path = event.get("path") or event.get("resourcePath") or ""
+    return path.rstrip("/").endswith("/movies/now-playing")
+
+
 @handle
 def handler(event, context):
     claims(event)
+    page = query_param(event, "page", "1")
+    if is_now_playing_request(event):
+        data = tmdb_get("/movie/now_playing", {"page": page})
+        return response(200, {"results": [normalize_movie(movie) for movie in data.get("results", [])]})
+
     query = query_param(event, "query") or query_param(event, "q")
     if not query or len(query.strip()) < 2:
         raise ApiError(400, "query must be at least 2 characters.")
-    page = query_param(event, "page", "1")
     data = tmdb_get("/search/movie", {"query": query.strip(), "page": page, "include_adult": "false"})
     return response(200, {"results": [normalize_movie(movie) for movie in data.get("results", [])]})
