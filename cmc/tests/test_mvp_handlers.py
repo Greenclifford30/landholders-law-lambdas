@@ -118,6 +118,10 @@ class FakeTable:
         item = self.items.get((Key["PK"], Key["SK"]))
         return {"Item": dict(item)} if item else {}
 
+    def delete_item(self, Key):
+        self.items.pop((Key["PK"], Key["SK"]), None)
+        return {}
+
     def update_item(self, Key, ExpressionAttributeValues, ExpressionAttributeNames=None, **kwargs):
         item = self.items[(Key["PK"], Key["SK"])]
         names = ExpressionAttributeNames or {}
@@ -645,6 +649,90 @@ class MvpHandlerTests(unittest.TestCase):
         self.assertEqual("2026-06-07", movie_night["dateWindowEnd"])
         self.assertEqual("60613", movie_night["zipCode"])
         self.assertEqual(["IMAX"], movie_night["preferredFormats"])
+
+    def test_manage_showtimes_updates_planning_movie_and_clears_old_children(self):
+        self.seed_movie_night("planning")
+        self.seed_showtime()
+        self.table.put_item(
+            Item={
+                "PK": "MOVIE_NIGHT#mn-1",
+                "SK": "SHOWTIME_IMPORT#sij-1",
+                "movieNightId": "mn-1",
+                "importJobId": "sij-1",
+                "status": "completed",
+            }
+        )
+        app = load_app("manage-showtimes-lambda", self.table)
+        result = app.handler(
+            event(
+                "POST",
+                movie_night_id="mn-1",
+                body={
+                    "action": "updatePlanning",
+                    "targetDate": "2026-06-05",
+                    "dateWindowStart": "2026-06-05",
+                    "dateWindowEnd": "2026-06-06",
+                    "zipCode": "60422",
+                    "radiusMiles": 30,
+                    "movie": {"externalId": "2", "title": "Sinners", "rating": 8.1},
+                },
+            ),
+            None,
+        )
+
+        self.assertEqual(200, result["statusCode"])
+        movie_night = self.table.items[("CLUB#club-1", "MOVIE_NIGHT#mn-1")]
+        self.assertEqual("2", movie_night["movie"]["externalId"])
+        self.assertEqual("Sinners", movie_night["movie"]["title"])
+        self.assertEqual(Decimal("8.1"), movie_night["movie"]["rating"])
+        self.assertEqual("idle", movie_night["showtimeImportStatus"])
+        self.assertEqual({}, movie_night["lastShowtimeImportSummary"])
+        self.assertNotIn(("MOVIE_NIGHT#mn-1", "SHOWTIME#st-1"), self.table.items)
+        self.assertNotIn(("MOVIE_NIGHT#mn-1", "SHOWTIME_IMPORT#sij-1"), self.table.items)
+
+    def test_manage_showtimes_updates_planning_fields_keep_showtimes(self):
+        self.seed_movie_night("planning")
+        self.seed_showtime()
+        app = load_app("manage-showtimes-lambda", self.table)
+        result = app.handler(
+            event(
+                "POST",
+                movie_night_id="mn-1",
+                body={
+                    "action": "updatePlanning",
+                    "targetDate": "2026-06-05",
+                    "dateWindowStart": "2026-06-05",
+                    "dateWindowEnd": "2026-06-06",
+                    "zipCode": "60422",
+                    "radiusMiles": 30,
+                },
+            ),
+            None,
+        )
+
+        self.assertEqual(200, result["statusCode"])
+        self.assertIn(("MOVIE_NIGHT#mn-1", "SHOWTIME#st-1"), self.table.items)
+
+    def test_manage_showtimes_rejects_planning_update_after_setup(self):
+        for status in ("voting", "confirmed", "completed", "cancelled"):
+            with self.subTest(status=status):
+                self.setUp()
+                self.seed_movie_night(status)
+                app = load_app("manage-showtimes-lambda", self.table)
+                result = app.handler(
+                    event(
+                        "POST",
+                        movie_night_id="mn-1",
+                        body={
+                            "action": "updatePlanning",
+                            "targetDate": "2026-06-05",
+                            "movie": {"externalId": "2", "title": "Sinners"},
+                        },
+                    ),
+                    None,
+                )
+
+                self.assertEqual(409, result["statusCode"])
 
     def test_manage_showtimes_imports_saved_date_window_idempotently(self):
         self.seed_movie_night("planning")

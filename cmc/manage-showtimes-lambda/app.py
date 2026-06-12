@@ -15,6 +15,7 @@ from cmc_shared import (
     handle,
     movie_night_pk,
     new_id,
+    normalize_movie_snapshot,
     normalize_planning_input,
     now_iso,
     parse_body,
@@ -221,7 +222,7 @@ def update_movie_night(movie_night, fields):
     assignments = []
     for key, value in fields.items():
         names[f"#{key}"] = key
-        values[f":{key}"] = value
+        values[f":{key}"] = dynamodb_value(value)
         assignments.append(f"#{key} = :{key}")
     table().update_item(
         Key={"PK": movie_night["PK"], "SK": movie_night["SK"]},
@@ -229,7 +230,7 @@ def update_movie_night(movie_night, fields):
         ExpressionAttributeNames=names,
         ExpressionAttributeValues=values,
     )
-    return {**movie_night, **fields}
+    return {**movie_night, **{key: dynamodb_value(value) for key, value in fields.items()}}
 
 
 def update_active_pointer(movie_night, fields):
@@ -240,7 +241,7 @@ def update_active_pointer(movie_night, fields):
     assignments = []
     for key, value in fields.items():
         names[f"#{key}"] = key
-        values[f":{key}"] = value
+        values[f":{key}"] = dynamodb_value(value)
         assignments.append(f"#{key} = :{key}")
     table().update_item(
         Key={"PK": f"CLUB#{movie_night['clubId']}", "SK": "ACTIVE_MOVIE_NIGHT"},
@@ -250,12 +251,46 @@ def update_active_pointer(movie_night, fields):
     )
 
 
+def movie_identity(movie):
+    movie = movie or {}
+    provider = str(movie.get("provider") or movie.get("externalProvider") or "").strip()
+    external_id = str(movie.get("externalId") or movie.get("externalMovieId") or "").strip()
+    title = normalize_title(movie.get("title"))
+    return provider, external_id, title
+
+
+def list_movie_night_children(movie_night_id, prefixes):
+    items = []
+    for prefix in prefixes:
+        result = table().query(
+            KeyConditionExpression=Key("PK").eq(movie_night_pk(movie_night_id)) & Key("SK").begins_with(prefix)
+        )
+        items.extend(result.get("Items", []))
+    return items
+
+
+def delete_movie_night_children(movie_night_id, prefixes):
+    for item in list_movie_night_children(movie_night_id, prefixes):
+        table().delete_item(Key={"PK": item["PK"], "SK": item["SK"]})
+
+
 def handle_update_planning(movie_night, payload):
-    if movie_night.get("status") in CLOSED_STATUSES:
-        raise ApiError(409, "Planning cannot be changed after confirmation.")
+    if movie_night.get("status") != "planning":
+        raise ApiError(409, "Planning can only be changed while the movie night is in setup.")
     updated_at = now_iso()
     planning = normalize_planning_input(payload.get("planning") or payload, movie_night)
     fields = {**planning, "updatedAt": updated_at}
+    if "movie" in payload or "selectedMovie" in payload:
+        movie = normalize_movie_snapshot(payload)
+        if movie_identity(movie) != movie_identity(movie_night.get("movie")):
+            delete_movie_night_children(movie_night["movieNightId"], ("SHOWTIME#", "SHOWTIME_IMPORT#"))
+            fields.update(
+                {
+                    "movie": movie,
+                    "showtimeImportStatus": "idle",
+                    "lastShowtimeImportSummary": {},
+                }
+            )
     updated = update_movie_night(movie_night, fields)
     update_active_pointer(movie_night, {"targetDate": planning["targetDate"], "updatedAt": updated_at})
     return response(200, {"movieNight": public_movie_night(updated)})
