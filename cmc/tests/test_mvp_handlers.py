@@ -283,6 +283,46 @@ class MvpHandlerTests(unittest.TestCase):
             }
         )
 
+    def test_preferences_are_stored_by_authenticated_sub(self):
+        app = load_app("manage-preferences-lambda", self.table)
+
+        missing = app.handler(event("GET", path="/me/preferences", user_id="user-1"), None)
+        self.assertEqual(404, missing["statusCode"])
+
+        saved = app.handler(
+            event(
+                "PUT",
+                path="/me/preferences",
+                user_id="user-1",
+                body={
+                    "defaultZipCode": "60422",
+                    "defaultRadiusMiles": 30,
+                    "preferredFormats": ["IMAX", "Dolby", "IMAX"],
+                },
+            ),
+            None,
+        )
+        self.assertEqual(200, saved["statusCode"])
+        self.assertEqual(["IMAX", "Dolby"], body(saved)["preferences"]["preferredFormats"])
+        self.assertIn(("USER#user-1", "PREFERENCES"), self.table.items)
+
+        loaded = app.handler(event("GET", path="/me/preferences", user_id="user-1"), None)
+        self.assertEqual(body(saved), body(loaded))
+        other_user = app.handler(event("GET", path="/me/preferences", user_id="user-2"), None)
+        self.assertEqual(404, other_user["statusCode"])
+
+    def test_preferences_validate_input(self):
+        app = load_app("manage-preferences-lambda", self.table)
+        invalid = app.handler(
+            event(
+                "PUT",
+                path="/me/preferences",
+                body={"defaultZipCode": "bad", "defaultRadiusMiles": 0, "preferredFormats": "IMAX"},
+            ),
+            None,
+        )
+        self.assertEqual(400, invalid["statusCode"])
+
     def test_platform_admin_can_create_club(self):
         app = load_app("manage-clubs-lambda", self.table)
         result = app.handler(event("POST", body={"name": "Friday Films"}), None)
