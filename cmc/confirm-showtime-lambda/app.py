@@ -11,6 +11,7 @@ from cmc_shared import (
     require_movie_night_membership,
     response,
     table,
+    voting_is_closed,
 )
 
 
@@ -19,6 +20,8 @@ def handler(event, context):
     movie_night_id = path_param(event, "movieNightId")
     user = claims(event)
     movie_night, _membership = require_movie_night_membership(movie_night_id, user["userId"], ADMIN_ROLES)
+    if movie_night.get("status") != "voting" or not voting_is_closed(movie_night):
+        raise ApiError(409, "Voting must be closed before confirming a showtime.")
     payload = parse_body(event)
     showtime_id = payload.get("showtimeId") or payload.get("confirmedShowtimeId")
     if not showtime_id:

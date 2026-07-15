@@ -11,6 +11,7 @@ from cmc_shared import (
     put_item,
     require_movie_night_membership,
     response,
+    voting_is_closed,
 )
 
 
@@ -26,8 +27,7 @@ def handler(event, context):
         raise ApiError(409, "Voting is not open for this movie night.")
     if movie_night.get("status") in CLOSED_STATUSES:
         raise ApiError(409, "Voting is closed for this movie night.")
-    voting_closes_at = movie_night.get("votingClosesAt")
-    if voting_closes_at and now_iso() > voting_closes_at:
+    if voting_is_closed(movie_night):
         raise ApiError(409, "Voting has closed for this movie night.")
 
     payload = parse_body(event)

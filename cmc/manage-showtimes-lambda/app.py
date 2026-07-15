@@ -1,10 +1,13 @@
 import hashlib
+import json
+import os
 import re
 from decimal import Decimal
 from zoneinfo import ZoneInfo
 from datetime import datetime, timezone
 
 from boto3.dynamodb.conditions import Key
+import boto3
 
 from cmc_shared import (
     ADMIN_ROLES,
@@ -19,6 +22,7 @@ from cmc_shared import (
     normalize_planning_input,
     now_iso,
     parse_body,
+    parse_iso_datetime,
     path_param,
     public_movie_night,
     require_movie_night_membership,
@@ -28,6 +32,7 @@ from cmc_shared import (
 
 
 CLOSED_STATUSES = {"confirmed", "completed", "cancelled"}
+sqs = boto3.client("sqs")
 
 
 def dynamodb_value(value):
@@ -324,7 +329,7 @@ def complete_import_job(job, fields):
     return updated
 
 
-def handle_import(movie_night):
+def handle_cached_import(movie_night):
     if movie_night.get("status") in CLOSED_STATUSES:
         raise ApiError(409, "Showtimes cannot be imported after confirmation.")
     planning = normalize_planning_input({}, movie_night)
@@ -404,6 +409,46 @@ def handle_import(movie_night):
         raise
 
 
+def handle_import(movie_night):
+    queue_url = os.environ.get("SHOWTIME_REFRESH_QUEUE_URL")
+    if not queue_url:
+        return handle_cached_import(movie_night)
+    if movie_night.get("status") in CLOSED_STATUSES:
+        raise ApiError(409, "Showtimes cannot be imported after confirmation.")
+    planning = normalize_planning_input({}, movie_night)
+    if not planning.get("zipCode") or not planning.get("radiusMiles"):
+        raise ApiError(400, "zipCode and radiusMiles must be saved before importing showtimes.")
+    requested_dates = expand_date_window(planning["dateWindowStart"], planning["dateWindowEnd"])
+    created_at = now_iso()
+    params = {
+        "movieExternalId": (movie_night.get("movie") or {}).get("externalId", ""),
+        "zipCode": planning["zipCode"],
+        "radiusMiles": planning["radiusMiles"],
+        "dateWindowStart": planning["dateWindowStart"],
+        "dateWindowEnd": planning["dateWindowEnd"],
+    }
+    job = create_import_job(movie_night, params, requested_dates, created_at)
+    job["status"] = "queued"
+    table().put_item(Item=sanitize_item(job))
+    updated = update_movie_night(movie_night, {"showtimeImportStatus": "queued", "updatedAt": created_at})
+    message = {
+        "provider": "gracenote",
+        "zip": planning["zipCode"],
+        "radius": planning["radiusMiles"],
+        "units": "mi",
+        "startDate": planning["dateWindowStart"],
+        "numDays": len(requested_dates),
+        "requestedBy": "movie-night-import",
+        "movieNightId": movie_night["movieNightId"],
+        "clubId": movie_night["clubId"],
+        "importJobId": job["importJobId"],
+        "movieTitle": (movie_night.get("movie") or {}).get("title", ""),
+        "timezone": movie_night.get("timezone") or "America/Chicago",
+    }
+    sqs.send_message(QueueUrl=queue_url, MessageBody=json.dumps(message))
+    return response(202, {"importJob": public_movie_night(job), "movieNight": public_movie_night(updated)})
+
+
 def update_candidate_status(movie_night, showtime_id, status):
     item = get_item(movie_night_pk(movie_night["movieNightId"]), f"SHOWTIME#{showtime_id}")
     if not item:
@@ -442,21 +487,38 @@ def approved_showtimes(movie_night_id):
     ]
 
 
-def handle_open_voting(movie_night):
+def handle_open_voting(movie_night, payload):
     if movie_night.get("status") != "planning":
         raise ApiError(409, "Voting can only be opened from planning.")
     approved = approved_showtimes(movie_night["movieNightId"])
     if len(approved) < 2:
         raise ApiError(400, "At least 2 approved showtimes are required before opening voting.")
+    voting_closes_at = parse_iso_datetime(payload.get("votingClosesAt"))
+    if not voting_closes_at or voting_closes_at <= datetime.now(timezone.utc):
+        raise ApiError(400, "votingClosesAt must be a future ISO timestamp.")
     updated_at = now_iso()
     fields = {
         "status": "voting",
         "GSI1PK": f"CLUB#{movie_night['clubId']}#STATUS#voting",
+        "votingClosesAt": voting_closes_at.replace(microsecond=0).isoformat().replace("+00:00", "Z"),
         "updatedAt": updated_at,
     }
     updated = update_movie_night(movie_night, fields)
     update_active_pointer(movie_night, {"status": "voting", "updatedAt": updated_at})
     return response(200, {"movieNight": public_movie_night(updated), "showtimes": [public_movie_night(item) for item in approved]})
+
+
+def handle_close_voting(movie_night, user):
+    if movie_night.get("status") != "voting":
+        raise ApiError(409, "Only open voting can be closed.")
+    if movie_night.get("votingClosedAt"):
+        return response(200, {"movieNight": public_movie_night(movie_night)})
+    closed_at = now_iso()
+    updated = update_movie_night(
+        movie_night,
+        {"votingClosedAt": closed_at, "votingClosedBy": user["userId"], "updatedAt": closed_at},
+    )
+    return response(200, {"movieNight": public_movie_night(updated)})
 
 
 def legacy_add_showtimes(movie_night, payload):
@@ -517,7 +579,9 @@ def handler(event, context):
     if action == "approveBulk":
         return handle_bulk_approve(movie_night, payload)
     if action == "openVoting":
-        return handle_open_voting(movie_night)
+        return handle_open_voting(movie_night, payload)
+    if action == "closeVoting":
+        return handle_close_voting(movie_night, user)
 
     if movie_night.get("status") in CLOSED_STATUSES:
         raise ApiError(409, "Showtimes cannot be changed after the movie night is confirmed.")

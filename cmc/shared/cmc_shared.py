@@ -41,6 +41,25 @@ def now_iso():
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
+def parse_iso_datetime(value):
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def voting_is_closed(movie_night, at=None):
+    if movie_night.get("votingClosedAt"):
+        return True
+    deadline = parse_iso_datetime(movie_night.get("votingClosesAt"))
+    return bool(deadline and deadline <= (at or datetime.now(timezone.utc)))
+
+
 def new_id(prefix):
     return f"{prefix}_{uuid.uuid4().hex[:12]}"
 

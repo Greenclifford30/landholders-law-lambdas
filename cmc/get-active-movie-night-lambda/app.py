@@ -17,7 +17,7 @@ from cmc_shared import (
 def handler(event, context):
     club_id = path_param(event, "clubId")
     user = claims(event)
-    require_membership(club_id, user["userId"])
+    membership = require_membership(club_id, user["userId"])
 
     pointer = active_pointer(club_id)
     if not pointer:
@@ -30,7 +30,10 @@ def handler(event, context):
     movie_night_id = movie_night["movieNightId"]
     vote = get_item(f"MOVIE_NIGHT#{movie_night_id}", f"VOTE#{user['userId']}")
     rsvp = get_item(f"MOVIE_NIGHT#{movie_night_id}", f"RSVP#{user['userId']}")
-    showtime_statuses = {"approved"} if movie_night.get("status") in {"voting", "confirmed"} else {"imported", "approved"}
+    if membership.get("role") == "admin" and movie_night.get("status") == "planning":
+        showtime_statuses = {"imported", "approved", "rejected"}
+    else:
+        showtime_statuses = {"approved"}
     return response(
         200,
         {
@@ -38,5 +41,6 @@ def handler(event, context):
             "showtimes": [public_movie_night(item) for item in list_showtimes_by_status(movie_night_id, showtime_statuses)],
             "currentUserVote": public_movie_night(vote) if vote else None,
             "currentUserRsvp": public_movie_night(rsvp) if rsvp else None,
+            "currentUserRole": membership.get("role"),
         },
     )

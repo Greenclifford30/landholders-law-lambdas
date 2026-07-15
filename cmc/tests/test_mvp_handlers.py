@@ -164,6 +164,10 @@ class FakeSes:
         self.sent.append(kwargs)
         return {"MessageId": "fake-message"}
 
+    def send_message(self, **kwargs):
+        self.sent.append(kwargs)
+        return {"MessageId": "fake-message"}
+
 
 class FakeDynamo:
     def __init__(self, table):
@@ -184,6 +188,9 @@ class FakeDynamoClient:
 class FakeSecrets:
     def get_secret_value(self, SecretId):
         return {"SecretString": '{"access_token":"tmdb-token"}'}
+
+    def send_message(self, **kwargs):
+        return {"MessageId": "fake-message"}
 
 
 def install_fake_aws(fake_table):
@@ -254,6 +261,7 @@ class MvpHandlerTests(unittest.TestCase):
     def setUp(self):
         os.environ["APP_TABLE_NAME"] = "cmc_app"
         os.environ["TMDB_SECRET_ARN"] = "arn:aws:secretsmanager:tmdb"
+        os.environ.pop("SHOWTIME_REFRESH_QUEUE_URL", None)
         self.table = FakeTable()
         self.table.put_item(Item={"PK": "CLUB#club-1", "SK": "META", "clubId": "club-1", "name": "Club One"})
         self.table.put_item(
@@ -648,12 +656,20 @@ class MvpHandlerTests(unittest.TestCase):
             }
         )
         app = load_app("manage-showtimes-lambda", self.table)
-        result = app.handler(event("POST", movie_night_id="mn-1", body={"action": "openVoting"}), None)
+        result = app.handler(
+            event(
+                "POST",
+                movie_night_id="mn-1",
+                body={"action": "openVoting", "votingClosesAt": "2099-06-01T01:00:00Z"},
+            ),
+            None,
+        )
 
         self.assertEqual(200, result["statusCode"])
         self.assertEqual("voting", body(result)["movieNight"]["status"])
         self.assertEqual("voting", self.table.items[("CLUB#club-1", "MOVIE_NIGHT#mn-1")]["status"])
         self.assertEqual("voting", self.table.items[("CLUB#club-1", "ACTIVE_MOVIE_NIGHT")]["status"])
+        self.assertEqual("2099-06-01T01:00:00Z", body(result)["movieNight"]["votingClosesAt"])
 
     def test_manage_showtimes_open_voting_requires_two_approved(self):
         self.seed_movie_night("planning")
@@ -662,6 +678,23 @@ class MvpHandlerTests(unittest.TestCase):
         result = app.handler(event("POST", movie_night_id="mn-1", body={"action": "openVoting"}), None)
 
         self.assertEqual(400, result["statusCode"])
+
+    def test_manage_showtimes_closes_voting(self):
+        self.seed_movie_night("voting")
+        app = load_app("manage-showtimes-lambda", self.table)
+        result = app.handler(event("POST", movie_night_id="mn-1", body={"action": "closeVoting"}), None)
+        self.assertEqual(200, result["statusCode"])
+        self.assertIn("votingClosedAt", body(result)["movieNight"])
+        self.assertEqual("user-1", body(result)["movieNight"]["votingClosedBy"])
+
+    def test_manage_showtimes_queues_provider_import(self):
+        self.seed_movie_night("planning")
+        os.environ["SHOWTIME_REFRESH_QUEUE_URL"] = "https://sqs.example/imports"
+        app = load_app("manage-showtimes-lambda", self.table)
+        result = app.handler(event("POST", movie_night_id="mn-1", body={"action": "import"}), None)
+        self.assertEqual(202, result["statusCode"])
+        self.assertEqual("queued", body(result)["importJob"]["status"])
+        self.assertEqual("queued", self.table.items[("CLUB#club-1", "MOVIE_NIGHT#mn-1")]["showtimeImportStatus"])
 
     def test_manage_showtimes_updates_planning(self):
         self.seed_movie_night("planning")
@@ -920,6 +953,7 @@ class MvpHandlerTests(unittest.TestCase):
 
     def test_confirm_showtime_sets_confirmed_status(self):
         self.seed_movie_night()
+        self.table.items[("CLUB#club-1", "MOVIE_NIGHT#mn-1")]["votingClosedAt"] = "2026-05-31T01:00:00Z"
         self.seed_showtime()
         app = load_app("confirm-showtime-lambda", self.table)
         result = app.handler(event("POST", movie_night_id="mn-1", body={"showtimeId": "st-1"}), None)
@@ -928,6 +962,7 @@ class MvpHandlerTests(unittest.TestCase):
 
     def test_confirm_showtime_allows_admin_pick_without_votes(self):
         self.seed_movie_night("voting")
+        self.table.items[("CLUB#club-1", "MOVIE_NIGHT#mn-1")]["votingClosedAt"] = "2026-05-31T01:00:00Z"
         self.seed_showtime()
         app = load_app("confirm-showtime-lambda", self.table)
         result = app.handler(event("POST", movie_night_id="mn-1", body={"showtimeId": "st-1"}), None)
@@ -935,6 +970,24 @@ class MvpHandlerTests(unittest.TestCase):
         self.assertEqual(200, result["statusCode"])
         self.assertEqual("confirmed", body(result)["status"])
         self.assertEqual("confirmed", self.table.items[("CLUB#club-1", "MOVIE_NIGHT#mn-1")]["status"])
+
+    def test_confirm_showtime_rejects_open_voting(self):
+        self.seed_movie_night("voting")
+        self.seed_showtime()
+        app = load_app("confirm-showtime-lambda", self.table)
+        result = app.handler(event("POST", movie_night_id="mn-1", body={"showtimeId": "st-1"}), None)
+        self.assertEqual(409, result["statusCode"])
+
+    def test_attendance_returns_member_rows_and_summary(self):
+        self.seed_movie_night("confirmed")
+        self.table.put_item(Item={"PK": "MOVIE_NIGHT#mn-1", "SK": "RSVP#user-1", "movieNightId": "mn-1", "userId": "user-1", "status": "going", "ticketStatus": "purchased"})
+        app = load_app("get-attendance-lambda", self.table)
+        result = app.handler(event("GET", movie_night_id="mn-1"), None)
+        self.assertEqual(200, result["statusCode"])
+        self.assertEqual(2, body(result)["summary"]["totalMembers"])
+        self.assertEqual(1, body(result)["summary"]["going"])
+        self.assertEqual(1, body(result)["summary"]["pending"])
+        self.assertEqual(2, len(body(result)["members"]))
 
     def test_complete_movie_night_sets_completed_status(self):
         self.seed_movie_night("confirmed")
