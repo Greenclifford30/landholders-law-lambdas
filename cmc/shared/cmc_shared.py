@@ -200,6 +200,30 @@ def transact_put_items(puts):
     return dynamodb_client.transact_write_items(TransactItems=transact_items)
 
 
+def transact_update_items(updates):
+    table_name = os.environ.get("APP_TABLE_NAME")
+    if not table_name:
+        raise ApiError(500, "APP_TABLE_NAME is not configured.")
+    transact_items = []
+    for update in updates:
+        transact_update = {
+            "TableName": table_name,
+            "Key": {key: type_serializer.serialize(value) for key, value in update["Key"].items()},
+            "UpdateExpression": update["UpdateExpression"],
+        }
+        if update.get("ExpressionAttributeNames"):
+            transact_update["ExpressionAttributeNames"] = update["ExpressionAttributeNames"]
+        if update.get("ExpressionAttributeValues"):
+            transact_update["ExpressionAttributeValues"] = {
+                key: type_serializer.serialize(dynamodb_value(value))
+                for key, value in update["ExpressionAttributeValues"].items()
+            }
+        if update.get("ConditionExpression"):
+            transact_update["ConditionExpression"] = update["ConditionExpression"]
+        transact_items.append({"Update": transact_update})
+    return dynamodb_client.transact_write_items(TransactItems=transact_items)
+
+
 def update_item(**kwargs):
     return table().update_item(**kwargs)
 

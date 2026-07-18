@@ -86,19 +86,29 @@ class FakeTable:
                 {"Error": {"Code": "ProvisionedThroughputExceededException", "Message": "throttled"}},
                 "TransactWriteItems",
             )
-        puts = [item["Put"] for item in TransactItems]
-        for put in puts:
-            item = put["Item"]
-            existing = self.items.get((item["PK"], item["SK"]))
-            condition = put.get("ConditionExpression")
-            if condition and not self._condition_matches(condition, existing, put):
+        for operation in TransactItems:
+            action = operation.get("Put") or operation.get("Update")
+            key = action.get("Item") or action.get("Key")
+            existing = self.items.get((key["PK"], key["SK"]))
+            condition = action.get("ConditionExpression")
+            if condition and not self._condition_matches(condition, existing, action):
                 raise FakeClientError(
                     {"Error": {"Code": "TransactionCanceledException", "Message": "condition failed"}},
                     "TransactWriteItems",
                 )
-        for put in puts:
-            item = put["Item"]
-            self.items[(item["PK"], item["SK"])] = dict(item)
+        for operation in TransactItems:
+            if "Put" in operation:
+                item = operation["Put"]["Item"]
+                self.items[(item["PK"], item["SK"])] = dict(item)
+            else:
+                update = operation["Update"]
+                item = self.items[(update["Key"]["PK"], update["Key"]["SK"])]
+                names = update.get("ExpressionAttributeNames") or {}
+                values = update.get("ExpressionAttributeValues") or {}
+                expression = update.get("UpdateExpression", "").removeprefix("SET ")
+                for assignment in expression.split(", "):
+                    attribute, value_key = assignment.split(" = ")
+                    item[names.get(attribute, attribute)] = values[value_key]
         return {}
 
     def _condition_matches(self, condition, existing, put):
@@ -112,6 +122,14 @@ class FakeTable:
             status_attr = names.get("#status", "status")
             active_statuses = {values[":planning"], values[":voting"], values[":confirmed"]}
             return existing.get(status_attr) not in active_statuses
+        if existing is None:
+            return False
+        names = put.get("ExpressionAttributeNames") or {}
+        values = put.get("ExpressionAttributeValues") or {}
+        for clause in condition.split(" AND "):
+            attribute, value_key = [part.strip() for part in clause.split("=", 1)]
+            if existing.get(names.get(attribute, attribute)) != values[value_key]:
+                return False
         return True
 
     def get_item(self, Key):
@@ -959,6 +977,40 @@ class MvpHandlerTests(unittest.TestCase):
         result = app.handler(event("POST", movie_night_id="mn-1", body={"showtimeId": "st-1"}), None)
         self.assertEqual(200, result["statusCode"])
         self.assertEqual("confirmed", body(result)["status"])
+
+    def test_confirm_showtime_initializes_and_increments_calendar_sequence(self):
+        self.seed_movie_night("voting")
+        self.table.items[("CLUB#club-1", "MOVIE_NIGHT#mn-1")]["votingClosedAt"] = "2026-05-31T01:00:00Z"
+        self.seed_showtime()
+        self.table.put_item(Item={**self.table.items[("MOVIE_NIGHT#mn-1", "SHOWTIME#st-1")], "showtimeId": "st-2", "SK": "SHOWTIME#st-2", "theaterName": "Davis Theater"})
+        app = load_app("confirm-showtime-lambda", self.table)
+        first = app.handler(event("POST", movie_night_id="mn-1", body={"showtimeId": "st-1"}), None)
+        self.assertEqual(0, body(first)["movieNight"]["calendarSequence"])
+        confirmed_at = body(first)["movieNight"]["confirmedAt"]
+        repeat = app.handler(event("POST", movie_night_id="mn-1", body={"showtimeId": "st-1"}), None)
+        self.assertEqual(0, body(repeat)["movieNight"]["calendarSequence"])
+        self.assertEqual(confirmed_at, body(repeat)["movieNight"]["confirmedAt"])
+        changed = app.handler(event("POST", movie_night_id="mn-1", body={"showtimeId": "st-2"}), None)
+        self.assertEqual(1, body(changed)["movieNight"]["calendarSequence"])
+
+    def test_calendar_requires_active_membership_and_confirmed_state(self):
+        app = load_app("get-calendar-lambda", self.table)
+        self.seed_movie_night("voting")
+        self.seed_showtime()
+        self.assertEqual(409, app.handler(event(movie_night_id="mn-1"), None)["statusCode"])
+        unauthorized = app.handler(event(movie_night_id="mn-1", user_id="unknown"), None)
+        self.assertEqual(404, unauthorized["statusCode"])
+
+    def test_calendar_returns_confirmed_movie_night_and_showtime(self):
+        app = load_app("get-calendar-lambda", self.table)
+        self.seed_movie_night("confirmed")
+        self.seed_showtime()
+        movie_night = self.table.items[("CLUB#club-1", "MOVIE_NIGHT#mn-1")]
+        movie_night["confirmedShowtimeId"] = "st-1"
+        movie_night["movie"] = {"title": "Heat", "runtime": 170}
+        result = app.handler(event(movie_night_id="mn-1"), None)
+        self.assertEqual(200, result["statusCode"])
+        self.assertEqual("st-1", body(result)["showtime"]["showtimeId"])
 
     def test_confirm_showtime_allows_admin_pick_without_votes(self):
         self.seed_movie_night("voting")
