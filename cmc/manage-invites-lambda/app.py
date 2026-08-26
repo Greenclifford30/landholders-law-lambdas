@@ -103,6 +103,7 @@ def create_invites(event):
     if not club:
         raise ApiError(404, "Club not found.")
     payload = parse_body(event)
+    is_share_link = payload.get("shareLink") is True
     raw_emails = payload.get("emails") or []
     if isinstance(raw_emails, str):
         raw_emails = [raw_emails]
@@ -111,8 +112,11 @@ def create_invites(event):
         normalized = normalize_email(email)
         if normalized not in emails:
             emails.append(normalized)
-    if not emails:
+    if not emails and not is_share_link:
         raise ApiError(400, "emails are required.")
+
+    if is_share_link:
+        emails = [None]
 
     created_at = now_iso()
     invites = []
@@ -123,13 +127,13 @@ def create_invites(event):
             "PK": club_pk(club_id),
             "SK": f"INVITE#{invite_id}",
             "GSI1PK": f"CLUB#{club_id}#INVITES#pending",
-            "GSI1SK": f"EMAIL#{email}#INVITE#{invite_id}",
+            "GSI1SK": f"{'SHARE' if email is None else f'EMAIL#{email}'}#INVITE#{invite_id}",
             "GSI2PK": f"INVITE_TOKEN#{token_hash(raw_token)}",
             "GSI2SK": f"CLUB#{club_id}#INVITE#{invite_id}",
             "clubId": club_id,
             "clubName": club.get("name", ""),
             "inviteId": invite_id,
-            "email": email,
+            "inviteType": "share_link" if email is None else "email",
             "role": "friend",
             "status": "pending",
             "tokenHash": token_hash(raw_token),
@@ -139,8 +143,11 @@ def create_invites(event):
             "createdAt": created_at,
             "updatedAt": created_at,
         }
+        if email is not None:
+            item["email"] = email
         table().put_item(Item=item)
-        send_invite_email(email, club, raw_token, event)
+        if email is not None:
+            send_invite_email(email, club, raw_token, event)
         public_item = invite_public(item)
         public_item["inviteUrl"] = f"{app_base_url(event)}/invites/{raw_token}"
         invites.append(public_item)
@@ -189,10 +196,33 @@ def accept_invite(event):
             ExpressionAttributeValues={":status": "expired", ":updatedAt": now_iso()},
         )
         raise ApiError(410, "Invite has expired.")
-    if normalize_email(user.get("email")) != invite.get("email"):
+    if invite.get("email") and normalize_email(user.get("email")) != invite.get("email"):
         raise ApiError(403, "This invite belongs to a different email address.")
 
     updated_at = now_iso()
+    try:
+        table().update_item(
+            Key={"PK": invite["PK"], "SK": invite["SK"]},
+            ConditionExpression="#status = :pending",
+            UpdateExpression=(
+                "SET #status = :status, acceptedBy = :userId, acceptedAt = :acceptedAt, "
+                "updatedAt = :updatedAt, GSI1PK = :gsi1pk"
+            ),
+            ExpressionAttributeNames={"#status": "status"},
+            ExpressionAttributeValues={
+                ":pending": "pending",
+                ":status": "accepted",
+                ":userId": user["userId"],
+                ":acceptedAt": updated_at,
+                ":updatedAt": updated_at,
+                ":gsi1pk": f"CLUB#{invite['clubId']}#INVITES#accepted",
+            },
+        )
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+            raise ApiError(409, "Invite is no longer pending.")
+        raise
+
     membership_key = {"PK": club_pk(invite["clubId"]), "SK": f"MEMBER#{user['userId']}"}
     existing_membership = table().get_item(Key=membership_key).get("Item")
     membership = {
@@ -201,7 +231,7 @@ def accept_invite(event):
         "GSI1SK": f"CLUB#{invite['clubId']}",
         "clubId": invite["clubId"],
         "userId": user["userId"],
-        "email": invite["email"],
+        "email": user.get("email") or "",
         "name": user.get("name") or "",
         "role": "friend",
         "status": "active",
@@ -219,21 +249,6 @@ def accept_invite(event):
         except ClientError as exc:
             if exc.response.get("Error", {}).get("Code") != "ConditionalCheckFailedException":
                 raise
-    table().update_item(
-        Key={"PK": invite["PK"], "SK": invite["SK"]},
-        UpdateExpression=(
-            "SET #status = :status, acceptedBy = :userId, acceptedAt = :acceptedAt, "
-            "updatedAt = :updatedAt, GSI1PK = :gsi1pk"
-        ),
-        ExpressionAttributeNames={"#status": "status"},
-        ExpressionAttributeValues={
-            ":status": "accepted",
-            ":userId": user["userId"],
-            ":acceptedAt": updated_at,
-            ":updatedAt": updated_at,
-            ":gsi1pk": f"CLUB#{invite['clubId']}#INVITES#accepted",
-        },
-    )
     return response(200, {"membership": public_movie_night(membership), "clubId": invite["clubId"]})
 
 
