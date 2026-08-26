@@ -25,6 +25,7 @@ from cmc_shared import (
 
 
 ses = boto3.client("ses")
+cognito = boto3.client("cognito-idp")
 
 
 def normalize_email(value):
@@ -97,6 +98,18 @@ def send_invite_email(email, club, token, event):
                 }
             },
         },
+    )
+
+
+def add_to_friend_group(user):
+    user_pool_id = os.environ.get("COGNITO_USER_POOL_ID")
+    if not user_pool_id:
+        raise ApiError(500, "Cognito user pool is not configured for invite acceptance.")
+    username = user["raw"].get("cognito:username") or user.get("email") or user["userId"]
+    cognito.admin_add_user_to_group(
+        UserPoolId=user_pool_id,
+        Username=username,
+        GroupName="Friend",
     )
 
 
@@ -192,6 +205,12 @@ def accept_invite(event):
     if not invite:
         raise ApiError(404, "Invite not found.")
     if invite.get("status") != "pending":
+        if invite.get("status") == "accepted" and invite.get("acceptedBy") == user["userId"]:
+            membership = table().get_item(
+                Key={"PK": club_pk(invite["clubId"]), "SK": f"MEMBER#{user['userId']}"}
+            ).get("Item")
+            if membership:
+                return response(200, {"membership": public_movie_night(membership), "clubId": invite["clubId"]})
         raise ApiError(409, "Invite is no longer pending.")
     if parse_iso(invite["expiresAt"]) < datetime.now(timezone.utc):
         table().update_item(
@@ -204,30 +223,9 @@ def accept_invite(event):
     if invite.get("email") and normalize_email(user.get("email")) != invite.get("email"):
         raise ApiError(403, "This invite belongs to a different email address.")
 
+    is_share_link = invite.get("inviteType") == "share_link" or not invite.get("email")
     updated_at = now_iso()
-    try:
-        table().update_item(
-            Key={"PK": invite["PK"], "SK": invite["SK"]},
-            ConditionExpression="#status = :pending",
-            UpdateExpression=(
-                "SET #status = :status, acceptedBy = :userId, acceptedAt = :acceptedAt, "
-                "updatedAt = :updatedAt, GSI1PK = :gsi1pk"
-            ),
-            ExpressionAttributeNames={"#status": "status"},
-            ExpressionAttributeValues={
-                ":pending": "pending",
-                ":status": "accepted",
-                ":userId": user["userId"],
-                ":acceptedAt": updated_at,
-                ":updatedAt": updated_at,
-                ":gsi1pk": f"CLUB#{invite['clubId']}#INVITES#accepted",
-            },
-        )
-    except ClientError as exc:
-        if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
-            raise ApiError(409, "Invite is no longer pending.")
-        raise
-
+    add_to_friend_group(user)
     membership_key = {"PK": club_pk(invite["clubId"]), "SK": f"MEMBER#{user['userId']}"}
     existing_membership = table().get_item(Key=membership_key).get("Item")
     membership = {
@@ -254,6 +252,29 @@ def accept_invite(event):
         except ClientError as exc:
             if exc.response.get("Error", {}).get("Code") != "ConditionalCheckFailedException":
                 raise
+    if not is_share_link:
+        try:
+            table().update_item(
+                Key={"PK": invite["PK"], "SK": invite["SK"]},
+                ConditionExpression="#status = :pending",
+                UpdateExpression=(
+                    "SET #status = :status, acceptedBy = :userId, acceptedAt = :acceptedAt, "
+                    "updatedAt = :updatedAt, GSI1PK = :gsi1pk"
+                ),
+                ExpressionAttributeNames={"#status": "status"},
+                ExpressionAttributeValues={
+                    ":pending": "pending",
+                    ":status": "accepted",
+                    ":userId": user["userId"],
+                    ":acceptedAt": updated_at,
+                    ":updatedAt": updated_at,
+                    ":gsi1pk": f"CLUB#{invite['clubId']}#INVITES#accepted",
+                },
+            )
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+                raise ApiError(409, "Invite is no longer pending.")
+            raise
     return response(200, {"membership": public_movie_night(membership), "clubId": invite["clubId"]})
 
 

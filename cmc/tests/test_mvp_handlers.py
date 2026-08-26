@@ -218,14 +218,26 @@ class FakeSecrets:
         return {"MessageId": "fake-message"}
 
 
+class FakeCognito:
+    def __init__(self):
+        self.group_additions = []
+
+    def admin_add_user_to_group(self, **kwargs):
+        self.group_additions.append(kwargs)
+        return {}
+
+
 def install_fake_aws(fake_table):
     fake_ses = FakeSes()
+    fake_cognito = FakeCognito()
     fake_boto3 = types.SimpleNamespace(
         resource=lambda service_name: FakeDynamo(fake_table),
         client=lambda service_name: FakeDynamoClient(fake_table)
         if service_name == "dynamodb"
         else fake_ses
         if service_name == "ses"
+        else fake_cognito
+        if service_name == "cognito-idp"
         else FakeSecrets(),
     )
     fake_conditions = types.SimpleNamespace(Key=FakeKey)
@@ -251,7 +263,7 @@ def load_app(lambda_dir, fake_table):
     return module
 
 
-def event(method="GET", path=None, body=None, user_id="user-1", club_id=None, movie_night_id=None, query=None, groups="Admin"):
+def event(method="GET", path=None, body=None, user_id="user-1", club_id=None, movie_night_id=None, query=None, groups="Admin", headers=None):
     path_params = {}
     if club_id:
         path_params["clubId"] = club_id
@@ -265,6 +277,7 @@ def event(method="GET", path=None, body=None, user_id="user-1", club_id=None, mo
         "path": path or "/",
         "pathParameters": path_params,
         "queryStringParameters": query or {},
+        "headers": headers or {},
         "body": json.dumps(body or {}),
         "requestContext": {
             "authorizer": {
@@ -286,6 +299,7 @@ class MvpHandlerTests(unittest.TestCase):
     def setUp(self):
         os.environ["APP_TABLE_NAME"] = "cmc_app"
         os.environ["TMDB_SECRET_ARN"] = "arn:aws:secretsmanager:tmdb"
+        os.environ["COGNITO_USER_POOL_ID"] = "us-east-1_test"
         os.environ.pop("SHOWTIME_REFRESH_QUEUE_URL", None)
         self.table = FakeTable()
         self.table.put_item(Item={"PK": "CLUB#club-1", "SK": "META", "clubId": "club-1", "name": "Club One"})
@@ -406,12 +420,32 @@ class MvpHandlerTests(unittest.TestCase):
         self.assertEqual(200, accepted["statusCode"])
         self.assertEqual("user-2@example.com", self.table.items[("CLUB#club-1", "MEMBER#user-2")]["email"])
 
-    def test_share_link_can_only_be_claimed_once(self):
+    def test_share_link_uses_the_forwarded_app_origin(self):
+        app = load_app("manage-invites-lambda", self.table)
+        with patch.dict(os.environ, {"APP_BASE_URL": "http://localhost:3000"}, clear=False):
+            result = app.handler(
+                event("POST", club_id="club-1", body={"shareLink": True}, headers={"x-movie-club-app-origin": "https://movies.example.com"}),
+                None,
+            )
+        self.assertTrue(body(result)["invites"][0]["inviteUrl"].startswith("https://movies.example.com/invites/"))
+
+    def test_share_link_can_be_claimed_by_multiple_people(self):
         app = load_app("manage-invites-lambda", self.table)
         created = app.handler(event("POST", club_id="club-1", body={"shareLink": True}), None)
         token = body(created)["invites"][0]["inviteUrl"].rsplit("/", 1)[-1]
         self.assertEqual(200, app.handler(event("POST", path=f"/invites/{token}", user_id="user-2", body={}), None)["statusCode"])
-        self.assertEqual(409, app.handler(event("POST", path=f"/invites/{token}", user_id="user-1", body={}), None)["statusCode"])
+        self.assertEqual(200, app.handler(event("POST", path=f"/invites/{token}", user_id="user-3", body={}), None)["statusCode"])
+        self.assertIn(("CLUB#club-1", "MEMBER#user-3"), self.table.items)
+        self.assertEqual("pending", next(item for item in self.table.items.values() if item.get("inviteId") == body(created)["invites"][0]["inviteId"])["status"])
+        self.assertEqual("Friend", app.cognito.group_additions[-1]["GroupName"])
+
+    def test_accepted_invite_can_be_retried_by_the_same_user(self):
+        app = load_app("manage-invites-lambda", self.table)
+        created = app.handler(event("POST", club_id="club-1", body={"shareLink": True}), None)
+        token = body(created)["invites"][0]["inviteUrl"].rsplit("/", 1)[-1]
+        app.handler(event("POST", path=f"/invites/{token}", user_id="user-2", body={}), None)
+        retried = app.handler(event("POST", path=f"/invites/{token}", user_id="user-2", body={}), None)
+        self.assertEqual(200, retried["statusCode"])
 
     def test_accept_invite_creates_friend_membership(self):
         app = load_app("manage-invites-lambda", self.table)
