@@ -86,19 +86,29 @@ class FakeTable:
                 {"Error": {"Code": "ProvisionedThroughputExceededException", "Message": "throttled"}},
                 "TransactWriteItems",
             )
-        puts = [item["Put"] for item in TransactItems]
-        for put in puts:
-            item = put["Item"]
-            existing = self.items.get((item["PK"], item["SK"]))
-            condition = put.get("ConditionExpression")
-            if condition and not self._condition_matches(condition, existing, put):
+        for operation in TransactItems:
+            action = operation.get("Put") or operation.get("Update")
+            key = action.get("Item") or action.get("Key")
+            existing = self.items.get((key["PK"], key["SK"]))
+            condition = action.get("ConditionExpression")
+            if condition and not self._condition_matches(condition, existing, action):
                 raise FakeClientError(
                     {"Error": {"Code": "TransactionCanceledException", "Message": "condition failed"}},
                     "TransactWriteItems",
                 )
-        for put in puts:
-            item = put["Item"]
-            self.items[(item["PK"], item["SK"])] = dict(item)
+        for operation in TransactItems:
+            if "Put" in operation:
+                item = operation["Put"]["Item"]
+                self.items[(item["PK"], item["SK"])] = dict(item)
+            else:
+                update = operation["Update"]
+                item = self.items[(update["Key"]["PK"], update["Key"]["SK"])]
+                names = update.get("ExpressionAttributeNames") or {}
+                values = update.get("ExpressionAttributeValues") or {}
+                expression = update.get("UpdateExpression", "").removeprefix("SET ")
+                for assignment in expression.split(", "):
+                    attribute, value_key = assignment.split(" = ")
+                    item[names.get(attribute, attribute)] = values[value_key]
         return {}
 
     def _condition_matches(self, condition, existing, put):
@@ -112,11 +122,23 @@ class FakeTable:
             status_attr = names.get("#status", "status")
             active_statuses = {values[":planning"], values[":voting"], values[":confirmed"]}
             return existing.get(status_attr) not in active_statuses
+        if existing is None:
+            return False
+        names = put.get("ExpressionAttributeNames") or {}
+        values = put.get("ExpressionAttributeValues") or {}
+        for clause in condition.split(" AND "):
+            attribute, value_key = [part.strip() for part in clause.split("=", 1)]
+            if existing.get(names.get(attribute, attribute)) != values[value_key]:
+                return False
         return True
 
     def get_item(self, Key):
         item = self.items.get((Key["PK"], Key["SK"]))
         return {"Item": dict(item)} if item else {}
+
+    def delete_item(self, Key):
+        self.items.pop((Key["PK"], Key["SK"]), None)
+        return {}
 
     def update_item(self, Key, ExpressionAttributeValues, ExpressionAttributeNames=None, **kwargs):
         item = self.items[(Key["PK"], Key["SK"])]
@@ -167,6 +189,10 @@ class FakeSes:
         self.sent.append(kwargs)
         return {"MessageId": "fake-message"}
 
+    def send_message(self, **kwargs):
+        self.sent.append(kwargs)
+        return {"MessageId": "fake-message"}
+
 
 class FakeDynamo:
     def __init__(self, table):
@@ -187,6 +213,9 @@ class FakeDynamoClient:
 class FakeSecrets:
     def get_secret_value(self, SecretId):
         return {"SecretString": '{"access_token":"tmdb-token"}'}
+
+    def send_message(self, **kwargs):
+        return {"MessageId": "fake-message"}
 
 
 def install_fake_aws(fake_table):
@@ -257,6 +286,7 @@ class MvpHandlerTests(unittest.TestCase):
     def setUp(self):
         os.environ["APP_TABLE_NAME"] = "cmc_app"
         os.environ["TMDB_SECRET_ARN"] = "arn:aws:secretsmanager:tmdb"
+        os.environ.pop("SHOWTIME_REFRESH_QUEUE_URL", None)
         self.table = FakeTable()
         self.table.put_item(Item={"PK": "CLUB#club-1", "SK": "META", "clubId": "club-1", "name": "Club One"})
         self.table.put_item(
@@ -285,6 +315,46 @@ class MvpHandlerTests(unittest.TestCase):
                 "status": "active",
             }
         )
+
+    def test_preferences_are_stored_by_authenticated_sub(self):
+        app = load_app("manage-preferences-lambda", self.table)
+
+        missing = app.handler(event("GET", path="/me/preferences", user_id="user-1"), None)
+        self.assertEqual(404, missing["statusCode"])
+
+        saved = app.handler(
+            event(
+                "PUT",
+                path="/me/preferences",
+                user_id="user-1",
+                body={
+                    "defaultZipCode": "60422",
+                    "defaultRadiusMiles": 30,
+                    "preferredFormats": ["IMAX", "Dolby", "IMAX"],
+                },
+            ),
+            None,
+        )
+        self.assertEqual(200, saved["statusCode"])
+        self.assertEqual(["IMAX", "Dolby"], body(saved)["preferences"]["preferredFormats"])
+        self.assertIn(("USER#user-1", "PREFERENCES"), self.table.items)
+
+        loaded = app.handler(event("GET", path="/me/preferences", user_id="user-1"), None)
+        self.assertEqual(body(saved), body(loaded))
+        other_user = app.handler(event("GET", path="/me/preferences", user_id="user-2"), None)
+        self.assertEqual(404, other_user["statusCode"])
+
+    def test_preferences_validate_input(self):
+        app = load_app("manage-preferences-lambda", self.table)
+        invalid = app.handler(
+            event(
+                "PUT",
+                path="/me/preferences",
+                body={"defaultZipCode": "bad", "defaultRadiusMiles": 0, "preferredFormats": "IMAX"},
+            ),
+            None,
+        )
+        self.assertEqual(400, invalid["statusCode"])
 
     def test_platform_admin_can_create_club(self):
         app = load_app("manage-clubs-lambda", self.table)
@@ -410,6 +480,11 @@ class MvpHandlerTests(unittest.TestCase):
         stored_movie = self.table.items[("CLUB#club-1", f"MOVIE_NIGHT#{movie_night_id}")]["movie"]
         self.assertEqual(Decimal("8.5"), stored_movie["rating"])
         self.assertEqual(Decimal("123.4"), stored_movie["popularity"])
+        stored_night = self.table.items[("CLUB#club-1", f"MOVIE_NIGHT#{movie_night_id}")]
+        self.assertEqual("2026-06-01", stored_night["dateWindowStart"])
+        self.assertEqual("2026-06-01", stored_night["dateWindowEnd"])
+        self.assertEqual("America/Chicago", stored_night["timezone"])
+        self.assertEqual("idle", stored_night["showtimeImportStatus"])
 
     def test_create_movie_night_duplicate_id_returns_conflict(self):
         self.table.put_item(
@@ -517,6 +592,11 @@ class MvpHandlerTests(unittest.TestCase):
             "movieNightId": "mn-1",
             "status": status,
             "targetDate": "2026-06-01",
+            "dateWindowStart": "2026-06-01",
+            "dateWindowEnd": "2026-06-03",
+            "zipCode": "60422",
+            "radiusMiles": 30,
+            "timezone": "America/Chicago",
             "movie": {"title": "Heat"},
         }
         self.table.put_item(Item=item)
@@ -531,6 +611,7 @@ class MvpHandlerTests(unittest.TestCase):
                 "movieNightId": "mn-1",
                 "theaterName": "Music Box",
                 "startsAtUtc": "2026-06-01T01:00:00Z",
+                "status": "approved",
             }
         )
 
@@ -584,7 +665,8 @@ class MvpHandlerTests(unittest.TestCase):
         self.assertEqual("70mm", imported["screenFormat"])
         self.assertEqual("https://tickets.example", imported["ticketURI"])
         self.assertEqual(["70mm"], imported["quals"])
-        self.assertEqual("voting", response_body["movieNight"]["status"])
+        self.assertEqual("approved", imported["status"])
+        self.assertEqual("planning", response_body["movieNight"]["status"])
         self.assertIn(("MOVIE_NIGHT#mn-1", f"SHOWTIME#{imported['showtimeId']}"), self.table.items)
 
     def test_manage_showtimes_import_sanitizes_cached_provider_values(self):
@@ -603,22 +685,226 @@ class MvpHandlerTests(unittest.TestCase):
         self.assertEqual(Decimal("1.0"), stored["quals"][0]["score"])
         self.assertNotIn("extra", stored["quals"][0])
 
-    def test_manage_showtimes_opens_voting_and_updates_active_pointer(self):
+    def test_manage_showtimes_open_voting_updates_active_pointer(self):
+        self.seed_movie_night("planning")
+        self.seed_showtime()
+        self.table.put_item(
+            Item={
+                "PK": "MOVIE_NIGHT#mn-1",
+                "SK": "SHOWTIME#st-2",
+                "showtimeId": "st-2",
+                "movieNightId": "mn-1",
+                "theaterName": "Music Box",
+                "startsAtUtc": "2026-06-01T03:00:00Z",
+                "status": "approved",
+            }
+        )
+        app = load_app("manage-showtimes-lambda", self.table)
+        result = app.handler(
+            event(
+                "POST",
+                movie_night_id="mn-1",
+                body={"action": "openVoting", "votingClosesAt": "2099-06-01T01:00:00Z"},
+            ),
+            None,
+        )
+
+        self.assertEqual(200, result["statusCode"])
+        self.assertEqual("voting", body(result)["movieNight"]["status"])
+        self.assertEqual("voting", self.table.items[("CLUB#club-1", "MOVIE_NIGHT#mn-1")]["status"])
+        self.assertEqual("voting", self.table.items[("CLUB#club-1", "ACTIVE_MOVIE_NIGHT")]["status"])
+        self.assertEqual("2099-06-01T01:00:00Z", body(result)["movieNight"]["votingClosesAt"])
+
+    def test_manage_showtimes_open_voting_requires_two_approved(self):
+        self.seed_movie_night("planning")
+        self.seed_showtime()
+        app = load_app("manage-showtimes-lambda", self.table)
+        result = app.handler(event("POST", movie_night_id="mn-1", body={"action": "openVoting"}), None)
+
+        self.assertEqual(400, result["statusCode"])
+
+    def test_manage_showtimes_closes_voting(self):
+        self.seed_movie_night("voting")
+        app = load_app("manage-showtimes-lambda", self.table)
+        result = app.handler(event("POST", movie_night_id="mn-1", body={"action": "closeVoting"}), None)
+        self.assertEqual(200, result["statusCode"])
+        self.assertIn("votingClosedAt", body(result)["movieNight"])
+        self.assertEqual("user-1", body(result)["movieNight"]["votingClosedBy"])
+
+    def test_manage_showtimes_queues_provider_import(self):
+        self.seed_movie_night("planning")
+        os.environ["SHOWTIME_REFRESH_QUEUE_URL"] = "https://sqs.example/imports"
+        app = load_app("manage-showtimes-lambda", self.table)
+        result = app.handler(event("POST", movie_night_id="mn-1", body={"action": "import"}), None)
+        self.assertEqual(202, result["statusCode"])
+        self.assertEqual("queued", body(result)["importJob"]["status"])
+        self.assertEqual("queued", self.table.items[("CLUB#club-1", "MOVIE_NIGHT#mn-1")]["showtimeImportStatus"])
+
+    def test_manage_showtimes_updates_planning(self):
         self.seed_movie_night("planning")
         app = load_app("manage-showtimes-lambda", self.table)
         result = app.handler(
             event(
                 "POST",
                 movie_night_id="mn-1",
-                body={"showtimes": [{"showtimeId": "st-1", "theaterName": "Music Box", "startsAtUtc": "2026-06-01T01:00:00Z"}]},
+                body={
+                    "action": "updatePlanning",
+                    "targetDate": "2026-06-05",
+                    "dateWindowStart": "2026-06-04",
+                    "dateWindowEnd": "2026-06-07",
+                    "zipCode": "60613",
+                    "radiusMiles": 20,
+                    "preferredFormats": ["IMAX"],
+                },
             ),
             None,
         )
 
-        self.assertEqual(201, result["statusCode"])
-        self.assertEqual("voting", body(result)["movieNight"]["status"])
-        self.assertEqual("voting", self.table.items[("CLUB#club-1", "MOVIE_NIGHT#mn-1")]["status"])
-        self.assertEqual("voting", self.table.items[("CLUB#club-1", "ACTIVE_MOVIE_NIGHT")]["status"])
+        self.assertEqual(200, result["statusCode"])
+        movie_night = self.table.items[("CLUB#club-1", "MOVIE_NIGHT#mn-1")]
+        self.assertEqual("2026-06-04", movie_night["dateWindowStart"])
+        self.assertEqual("2026-06-07", movie_night["dateWindowEnd"])
+        self.assertEqual("60613", movie_night["zipCode"])
+        self.assertEqual(["IMAX"], movie_night["preferredFormats"])
+
+    def test_manage_showtimes_updates_planning_movie_and_clears_old_children(self):
+        self.seed_movie_night("planning")
+        self.seed_showtime()
+        self.table.put_item(
+            Item={
+                "PK": "MOVIE_NIGHT#mn-1",
+                "SK": "SHOWTIME_IMPORT#sij-1",
+                "movieNightId": "mn-1",
+                "importJobId": "sij-1",
+                "status": "completed",
+            }
+        )
+        app = load_app("manage-showtimes-lambda", self.table)
+        result = app.handler(
+            event(
+                "POST",
+                movie_night_id="mn-1",
+                body={
+                    "action": "updatePlanning",
+                    "targetDate": "2026-06-05",
+                    "dateWindowStart": "2026-06-05",
+                    "dateWindowEnd": "2026-06-06",
+                    "zipCode": "60422",
+                    "radiusMiles": 30,
+                    "movie": {"externalId": "2", "title": "Sinners", "rating": 8.1},
+                },
+            ),
+            None,
+        )
+
+        self.assertEqual(200, result["statusCode"])
+        movie_night = self.table.items[("CLUB#club-1", "MOVIE_NIGHT#mn-1")]
+        self.assertEqual("2", movie_night["movie"]["externalId"])
+        self.assertEqual("Sinners", movie_night["movie"]["title"])
+        self.assertEqual(Decimal("8.1"), movie_night["movie"]["rating"])
+        self.assertEqual("idle", movie_night["showtimeImportStatus"])
+        self.assertEqual({}, movie_night["lastShowtimeImportSummary"])
+        self.assertNotIn(("MOVIE_NIGHT#mn-1", "SHOWTIME#st-1"), self.table.items)
+        self.assertNotIn(("MOVIE_NIGHT#mn-1", "SHOWTIME_IMPORT#sij-1"), self.table.items)
+
+    def test_manage_showtimes_updates_planning_fields_keep_showtimes(self):
+        self.seed_movie_night("planning")
+        self.seed_showtime()
+        app = load_app("manage-showtimes-lambda", self.table)
+        result = app.handler(
+            event(
+                "POST",
+                movie_night_id="mn-1",
+                body={
+                    "action": "updatePlanning",
+                    "targetDate": "2026-06-05",
+                    "dateWindowStart": "2026-06-05",
+                    "dateWindowEnd": "2026-06-06",
+                    "zipCode": "60422",
+                    "radiusMiles": 30,
+                },
+            ),
+            None,
+        )
+
+        self.assertEqual(200, result["statusCode"])
+        self.assertIn(("MOVIE_NIGHT#mn-1", "SHOWTIME#st-1"), self.table.items)
+
+    def test_manage_showtimes_rejects_planning_update_after_setup(self):
+        for status in ("voting", "confirmed", "completed", "cancelled"):
+            with self.subTest(status=status):
+                self.setUp()
+                self.seed_movie_night(status)
+                app = load_app("manage-showtimes-lambda", self.table)
+                result = app.handler(
+                    event(
+                        "POST",
+                        movie_night_id="mn-1",
+                        body={
+                            "action": "updatePlanning",
+                            "targetDate": "2026-06-05",
+                            "movie": {"externalId": "2", "title": "Sinners"},
+                        },
+                    ),
+                    None,
+                )
+
+                self.assertEqual(409, result["statusCode"])
+
+    def test_manage_showtimes_imports_saved_date_window_idempotently(self):
+        self.seed_movie_night("planning")
+        self.table.items[("CLUB#club-1", "MOVIE_NIGHT#mn-1")]["dateWindowStart"] = "2026-06-05"
+        self.table.items[("CLUB#club-1", "MOVIE_NIGHT#mn-1")]["dateWindowEnd"] = "2026-06-06"
+        first_key = self.seed_cached_showtime()
+        second_key = {
+            "PK": "SHOWTIME_CACHE#PROVIDER#gracenote#ZIP#60422#DATE#2026-06-06",
+            "SK": "TITLE#heat#MOVIE#MV0123456789#THEATER#999#START#2026-06-06T19:30:00#FORMAT#def",
+        }
+        self.table.put_item(
+            Item={
+                **second_key,
+                "provider": "gracenote",
+                "tmsId": "MV0123456789",
+                "title": "Heat",
+                "theatreId": "999",
+                "theatreName": "Music Box Theatre",
+                "startsAtUtc": "2026-06-07T00:30:00Z",
+                "localDateTime": "2026-06-06T19:30:00",
+                "screenFormat": "Standard",
+            }
+        )
+        # Match the current cache key prefix used by imported Gracenote records.
+        cached = self.table.items.pop((first_key["PK"], first_key["SK"]))
+        fixed_first_key = {
+            "PK": first_key["PK"],
+            "SK": "TITLE#heat#MOVIE#MV0123456789#THEATER#999#START#2026-06-05T19:30:00#FORMAT#abc",
+        }
+        self.table.put_item(Item={**cached, **fixed_first_key})
+
+        app = load_app("manage-showtimes-lambda", self.table)
+        first = app.handler(event("POST", movie_night_id="mn-1", body={"action": "import"}), None)
+        second = app.handler(event("POST", movie_night_id="mn-1", body={"action": "import"}), None)
+
+        self.assertEqual(200, first["statusCode"])
+        self.assertEqual(200, second["statusCode"])
+        self.assertEqual(2, body(first)["importJob"]["importedCount"])
+        self.assertEqual(0, body(first)["importJob"]["duplicateCount"])
+        self.assertEqual(0, body(second)["importJob"]["importedCount"])
+        self.assertEqual(2, body(second)["importJob"]["duplicateCount"])
+        movie_night = self.table.items[("CLUB#club-1", "MOVIE_NIGHT#mn-1")]
+        self.assertEqual("completed", movie_night["showtimeImportStatus"])
+        self.assertEqual(["2026-06-05", "2026-06-06"], movie_night["lastShowtimeImportSummary"]["requestedDates"])
+
+    def test_manage_showtimes_approve_and_reject_candidates(self):
+        self.seed_movie_night("planning")
+        self.seed_showtime()
+        self.table.items[("MOVIE_NIGHT#mn-1", "SHOWTIME#st-1")]["status"] = "imported"
+        app = load_app("manage-showtimes-lambda", self.table)
+        approved = app.handler(event("POST", movie_night_id="mn-1", body={"action": "approve", "showtimeId": "st-1"}), None)
+        rejected = app.handler(event("POST", movie_night_id="mn-1", body={"action": "reject", "showtimeId": "st-1"}), None)
+
+        self.assertEqual("approved", body(approved)["showtime"]["status"])
+        self.assertEqual("rejected", body(rejected)["showtime"]["status"])
 
     def test_manage_showtimes_rejects_closed_movie_nights(self):
         for status in ("confirmed", "completed", "cancelled"):
@@ -679,6 +965,14 @@ class MvpHandlerTests(unittest.TestCase):
         result = app.handler(event("PUT", movie_night_id="mn-1", body={"rankings": ["st-1", "st-1"]}), None)
         self.assertEqual(400, result["statusCode"])
 
+    def test_submit_vote_rejects_unapproved_showtime(self):
+        self.seed_movie_night()
+        self.seed_showtime()
+        self.table.items[("MOVIE_NIGHT#mn-1", "SHOWTIME#st-1")]["status"] = "imported"
+        app = load_app("submit-vote-lambda", self.table)
+        result = app.handler(event("PUT", movie_night_id="mn-1", body={"rankings": ["st-1"]}), None)
+        self.assertEqual(400, result["statusCode"])
+
     def test_vote_results_scores_ranked_votes(self):
         self.seed_movie_night()
         self.seed_showtime()
@@ -703,14 +997,50 @@ class MvpHandlerTests(unittest.TestCase):
 
     def test_confirm_showtime_sets_confirmed_status(self):
         self.seed_movie_night()
+        self.table.items[("CLUB#club-1", "MOVIE_NIGHT#mn-1")]["votingClosedAt"] = "2026-05-31T01:00:00Z"
         self.seed_showtime()
         app = load_app("confirm-showtime-lambda", self.table)
         result = app.handler(event("POST", movie_night_id="mn-1", body={"showtimeId": "st-1"}), None)
         self.assertEqual(200, result["statusCode"])
         self.assertEqual("confirmed", body(result)["status"])
 
+    def test_confirm_showtime_initializes_and_increments_calendar_sequence(self):
+        self.seed_movie_night("voting")
+        self.table.items[("CLUB#club-1", "MOVIE_NIGHT#mn-1")]["votingClosedAt"] = "2026-05-31T01:00:00Z"
+        self.seed_showtime()
+        self.table.put_item(Item={**self.table.items[("MOVIE_NIGHT#mn-1", "SHOWTIME#st-1")], "showtimeId": "st-2", "SK": "SHOWTIME#st-2", "theaterName": "Davis Theater"})
+        app = load_app("confirm-showtime-lambda", self.table)
+        first = app.handler(event("POST", movie_night_id="mn-1", body={"showtimeId": "st-1"}), None)
+        self.assertEqual(0, body(first)["movieNight"]["calendarSequence"])
+        confirmed_at = body(first)["movieNight"]["confirmedAt"]
+        repeat = app.handler(event("POST", movie_night_id="mn-1", body={"showtimeId": "st-1"}), None)
+        self.assertEqual(0, body(repeat)["movieNight"]["calendarSequence"])
+        self.assertEqual(confirmed_at, body(repeat)["movieNight"]["confirmedAt"])
+        changed = app.handler(event("POST", movie_night_id="mn-1", body={"showtimeId": "st-2"}), None)
+        self.assertEqual(1, body(changed)["movieNight"]["calendarSequence"])
+
+    def test_calendar_requires_active_membership_and_confirmed_state(self):
+        app = load_app("get-calendar-lambda", self.table)
+        self.seed_movie_night("voting")
+        self.seed_showtime()
+        self.assertEqual(409, app.handler(event(movie_night_id="mn-1"), None)["statusCode"])
+        unauthorized = app.handler(event(movie_night_id="mn-1", user_id="unknown"), None)
+        self.assertEqual(404, unauthorized["statusCode"])
+
+    def test_calendar_returns_confirmed_movie_night_and_showtime(self):
+        app = load_app("get-calendar-lambda", self.table)
+        self.seed_movie_night("confirmed")
+        self.seed_showtime()
+        movie_night = self.table.items[("CLUB#club-1", "MOVIE_NIGHT#mn-1")]
+        movie_night["confirmedShowtimeId"] = "st-1"
+        movie_night["movie"] = {"title": "Heat", "runtime": 170}
+        result = app.handler(event(movie_night_id="mn-1"), None)
+        self.assertEqual(200, result["statusCode"])
+        self.assertEqual("st-1", body(result)["showtime"]["showtimeId"])
+
     def test_confirm_showtime_allows_admin_pick_without_votes(self):
         self.seed_movie_night("voting")
+        self.table.items[("CLUB#club-1", "MOVIE_NIGHT#mn-1")]["votingClosedAt"] = "2026-05-31T01:00:00Z"
         self.seed_showtime()
         app = load_app("confirm-showtime-lambda", self.table)
         result = app.handler(event("POST", movie_night_id="mn-1", body={"showtimeId": "st-1"}), None)
@@ -718,6 +1048,77 @@ class MvpHandlerTests(unittest.TestCase):
         self.assertEqual(200, result["statusCode"])
         self.assertEqual("confirmed", body(result)["status"])
         self.assertEqual("confirmed", self.table.items[("CLUB#club-1", "MOVIE_NIGHT#mn-1")]["status"])
+
+    def test_confirm_showtime_rejects_open_voting(self):
+        self.seed_movie_night("voting")
+        self.seed_showtime()
+        app = load_app("confirm-showtime-lambda", self.table)
+        result = app.handler(event("POST", movie_night_id="mn-1", body={"showtimeId": "st-1"}), None)
+        self.assertEqual(409, result["statusCode"])
+
+    def test_attendance_returns_member_rows_and_summary(self):
+        self.seed_movie_night("confirmed")
+        self.table.put_item(Item={"PK": "MOVIE_NIGHT#mn-1", "SK": "RSVP#user-1", "movieNightId": "mn-1", "userId": "user-1", "status": "going", "ticketStatus": "purchased"})
+        app = load_app("get-attendance-lambda", self.table)
+        result = app.handler(event("GET", movie_night_id="mn-1"), None)
+        self.assertEqual(200, result["statusCode"])
+        self.assertEqual(2, body(result)["summary"]["totalMembers"])
+        self.assertEqual(1, body(result)["summary"]["going"])
+        self.assertEqual(1, body(result)["summary"]["pending"])
+        self.assertEqual(2, len(body(result)["members"]))
+
+    def test_complete_movie_night_sets_completed_status(self):
+        self.seed_movie_night("confirmed")
+        app = load_app("complete-movie-night-lambda", self.table)
+        result = app.handler(event("POST", movie_night_id="mn-1"), None)
+        movie_night = self.table.items[("CLUB#club-1", "MOVIE_NIGHT#mn-1")]
+        pointer = self.table.items[("CLUB#club-1", "ACTIVE_MOVIE_NIGHT")]
+
+        self.assertEqual(200, result["statusCode"])
+        self.assertEqual("completed", body(result)["movieNight"]["status"])
+        self.assertEqual("completed", movie_night["status"])
+        self.assertEqual("CLUB#club-1#STATUS#completed", movie_night["GSI1PK"])
+        self.assertEqual("user-1", movie_night["completedBy"])
+        self.assertIn("completedAt", movie_night)
+        self.assertEqual("completed", pointer["status"])
+
+    def test_complete_movie_night_rejects_non_confirmed_status(self):
+        for status in ("planning", "voting", "completed", "cancelled"):
+            with self.subTest(status=status):
+                self.table = FakeTable()
+                self.table.put_item(Item={"PK": "CLUB#club-1", "SK": "MEMBER#user-1", "role": "admin"})
+                self.table.put_item(Item={"PK": "CLUB#club-1", "SK": "MEMBER#user-2", "role": "friend"})
+                self.seed_movie_night(status)
+                app = load_app("complete-movie-night-lambda", self.table)
+                result = app.handler(event("POST", movie_night_id="mn-1"), None)
+                self.assertEqual(409, result["statusCode"])
+
+    def test_complete_movie_night_requires_admin(self):
+        self.seed_movie_night("confirmed")
+        app = load_app("complete-movie-night-lambda", self.table)
+        result = app.handler(event("POST", movie_night_id="mn-1", user_id="user-2"), None)
+        self.assertEqual(403, result["statusCode"])
+
+    def test_create_movie_night_allowed_after_completion(self):
+        self.seed_movie_night("confirmed")
+        complete_app = load_app("complete-movie-night-lambda", self.table)
+        complete_result = complete_app.handler(event("POST", movie_night_id="mn-1"), None)
+        self.assertEqual(200, complete_result["statusCode"])
+
+        create_app = load_app("create-movie-night-lambda", self.table)
+        create_result = create_app.handler(
+            event(
+                "POST",
+                club_id="club-1",
+                body={"targetDate": "2026-07-01", "movie": {"externalId": "2", "title": "Thief"}},
+            ),
+            None,
+        )
+        movie_night_id = body(create_result)["movieNight"]["movieNightId"]
+
+        self.assertEqual(201, create_result["statusCode"])
+        self.assertEqual(movie_night_id, self.table.items[("CLUB#club-1", "ACTIVE_MOVIE_NIGHT")]["movieNightId"])
+        self.assertEqual("planning", self.table.items[("CLUB#club-1", "ACTIVE_MOVIE_NIGHT")]["status"])
 
     def test_update_rsvp_requires_confirmed_movie_night(self):
         self.seed_movie_night("confirmed")
@@ -730,6 +1131,17 @@ class MvpHandlerTests(unittest.TestCase):
         app = load_app("list-history-lambda", self.table)
         result = app.handler(event(club_id="club-1"), None)
         self.assertEqual(1, len(body(result)["movieNights"]))
+
+    def test_list_history_returns_completed_nights(self):
+        self.seed_movie_night("confirmed")
+        complete_app = load_app("complete-movie-night-lambda", self.table)
+        complete_result = complete_app.handler(event("POST", movie_night_id="mn-1"), None)
+        self.assertEqual(200, complete_result["statusCode"])
+
+        history_app = load_app("list-history-lambda", self.table)
+        result = history_app.handler(event(club_id="club-1"), None)
+        self.assertEqual(1, len(body(result)["movieNights"]))
+        self.assertEqual("completed", body(result)["movieNights"][0]["status"])
 
 
 if __name__ == "__main__":

@@ -336,11 +336,114 @@ def write_items(items):
         raise NonRetryableError("DynamoDB rejected the normalized showtime record.") from exc
 
 
+def now_iso():
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def candidate_from_cache(item, message, imported_at):
+    dedupe_key = item["SK"]
+    showtime_id = f"st_{hashlib.sha256(dedupe_key.encode('utf-8')).hexdigest()[:16]}"
+    return {
+        "PK": f"MOVIE_NIGHT#{message['movieNightId']}",
+        "SK": f"SHOWTIME#{showtime_id}",
+        "GSI1PK": f"MOVIE_NIGHT#{message['movieNightId']}#SHOWTIMES",
+        "GSI1SK": f"START#{item['startsAtUtc']}#SHOWTIME#{showtime_id}",
+        "movieNightId": message["movieNightId"],
+        "showtimeId": showtime_id,
+        "provider": "gracenote",
+        "externalMovieId": item.get("tmsId") or item.get("rootId") or "",
+        "providerMovieId": item.get("tmsId") or item.get("rootId") or "",
+        "externalTheaterId": item.get("providerTheaterId") or "",
+        "providerTheaterId": item.get("providerTheaterId") or "",
+        "theaterName": item.get("theaterName") or "",
+        "theaterLocation": item.get("theaterLocation") or "",
+        "theaterAddress": item.get("theaterLocation") or "",
+        "startsAt": item["startsAtUtc"],
+        "startsAtUtc": item["startsAtUtc"],
+        "localDate": item.get("localDateTime", "")[:10],
+        "localTime": item.get("localDateTime", "")[11:16],
+        "localDateTime": item.get("localDateTime") or "",
+        "timezone": message.get("timezone") or "America/Chicago",
+        "screenFormat": item.get("screenFormat") or "Standard",
+        "amenities": item.get("quals") or [],
+        "quals": item.get("quals") or [],
+        "ticketURI": item.get("ticketURI") or "",
+        "importJobId": message["importJobId"],
+        "dedupeKey": dedupe_key,
+        "status": "imported",
+        "createdAt": imported_at,
+        "updatedAt": imported_at,
+    }
+
+
+def update_import_state(message, status, summary=None, error_message=None):
+    if not message.get("movieNightId") or not message.get("importJobId"):
+        return
+    updated_at = now_iso()
+    app_table = dynamodb.Table(get_required_env("APP_TABLE_NAME"))
+    job_key = {"PK": f"MOVIE_NIGHT#{message['movieNightId']}", "SK": f"SHOWTIME_IMPORT#{message['importJobId']}"}
+    job = app_table.get_item(Key=job_key).get("Item") or job_key
+    job.update({"status": status, "updatedAt": updated_at})
+    if summary:
+        job.update(summary)
+    if error_message:
+        job["errorMessage"] = error_message
+    app_table.put_item(Item=job)
+    movie_night = app_table.query(
+        IndexName="GSI2",
+        KeyConditionExpression="GSI2PK = :pk",
+        ExpressionAttributeValues={":pk": f"MOVIE_NIGHT#{message['movieNightId']}"},
+        Limit=1,
+    ).get("Items", [])
+    if movie_night:
+        values = {":status": status, ":updatedAt": updated_at, ":summary": summary or {"errorMessage": error_message or ""}}
+        app_table.update_item(
+            Key={"PK": movie_night[0]["PK"], "SK": movie_night[0]["SK"]},
+            UpdateExpression="SET showtimeImportStatus = :status, lastShowtimeImportAt = :updatedAt, lastShowtimeImportSummary = :summary, updatedAt = :updatedAt",
+            ExpressionAttributeValues=values,
+        )
+
+
+def import_movie_night_candidates(items, message):
+    if not message.get("movieNightId") or not message.get("importJobId"):
+        return None
+    wanted_title = normalize_title(message.get("movieTitle"))
+    matched = [item for item in items if normalize_title(item.get("title")) == wanted_title]
+    imported_at = now_iso()
+    app_table = dynamodb.Table(get_required_env("APP_TABLE_NAME"))
+    imported_count = 0
+    duplicate_count = 0
+    with app_table.batch_writer(overwrite_by_pkeys=["PK", "SK"]) as batch:
+        for item in matched:
+            candidate = candidate_from_cache(item, message, imported_at)
+            existing = app_table.get_item(Key={"PK": candidate["PK"], "SK": candidate["SK"]}).get("Item")
+            if existing:
+                duplicate_count += 1
+                candidate["status"] = existing.get("status", "imported")
+                candidate["createdAt"] = existing.get("createdAt", imported_at)
+            else:
+                imported_count += 1
+            batch.put_item(Item=candidate)
+    summary = {
+        "resultCount": len(matched),
+        "importedCount": imported_count,
+        "duplicateCount": duplicate_count,
+        "requestedDates": [
+            (datetime.strptime(message["startDate"], "%Y-%m-%d").date() + timedelta(days=offset)).isoformat()
+            for offset in range(message["numDays"])
+        ],
+    }
+    update_import_state(message, "completed", summary=summary)
+    return summary
+
+
 def process_record(record):
     message = parse_message(record)
+    update_import_state(message, "running")
     response_data = call_gracenote(message)
     items = normalize_items(response_data, message)
     write_items(items)
+    import_movie_night_candidates(items, message)
     logger.info(
         "Stored Gracenote showtime cache records count=%s zip=%s startDate=%s",
         len(items),
@@ -357,11 +460,23 @@ def handler(event, context):
         try:
             process_record(record)
         except NonRetryableError as exc:
+            try:
+                update_import_state(parse_message(record), "failed", error_message=str(exc))
+            except Exception:
+                logger.exception("Unable to mark import failed for record %s", message_id)
             logger.warning("Dropping non-retryable Gracenote record %s: %s", message_id, exc)
         except RetryableError as exc:
+            try:
+                update_import_state(parse_message(record), "failed", error_message=str(exc))
+            except Exception:
+                logger.exception("Unable to mark retryable import failed for record %s", message_id)
             logger.warning("Retryable Gracenote record failure %s: %s", message_id, exc)
             failures.append({"itemIdentifier": message_id})
         except Exception:
+            try:
+                update_import_state(parse_message(record), "failed", error_message="Unexpected provider import failure.")
+            except Exception:
+                logger.exception("Unable to mark import failed for record %s", message_id)
             logger.exception("Unexpected Gracenote record failure %s", message_id)
             failures.append({"itemIdentifier": message_id})
 
