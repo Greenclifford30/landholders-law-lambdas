@@ -121,6 +121,13 @@ class FakeTable:
     def update_item(self, Key, ExpressionAttributeValues, ExpressionAttributeNames=None, **kwargs):
         item = self.items[(Key["PK"], Key["SK"])]
         names = ExpressionAttributeNames or {}
+        if kwargs.get("ConditionExpression") == "#status = :pending":
+            status_attr = names.get("#status", "status")
+            if item.get(status_attr) != ExpressionAttributeValues[":pending"]:
+                raise FakeClientError(
+                    {"Error": {"Code": "ConditionalCheckFailedException"}},
+                    "UpdateItem",
+                )
         for placeholder, value in ExpressionAttributeValues.items():
             if placeholder.startswith(":"):
                 continue
@@ -316,6 +323,25 @@ class MvpHandlerTests(unittest.TestCase):
         app = load_app("manage-invites-lambda", self.table)
         result = app.handler(event("POST", club_id="club-1", user_id="user-2", body={"emails": ["new@example.com"]}), None)
         self.assertEqual(403, result["statusCode"])
+
+    def test_club_admin_can_create_and_claim_share_link(self):
+        app = load_app("manage-invites-lambda", self.table)
+        created = app.handler(event("POST", club_id="club-1", body={"shareLink": True}), None)
+        self.assertEqual(201, created["statusCode"])
+        invite = body(created)["invites"][0]
+        self.assertEqual("share_link", invite["inviteType"])
+        self.assertNotIn("email", invite)
+        token = invite["inviteUrl"].rsplit("/", 1)[-1]
+        accepted = app.handler(event("POST", path=f"/invites/{token}", user_id="user-2", body={}), None)
+        self.assertEqual(200, accepted["statusCode"])
+        self.assertEqual("user-2@example.com", self.table.items[("CLUB#club-1", "MEMBER#user-2")]["email"])
+
+    def test_share_link_can_only_be_claimed_once(self):
+        app = load_app("manage-invites-lambda", self.table)
+        created = app.handler(event("POST", club_id="club-1", body={"shareLink": True}), None)
+        token = body(created)["invites"][0]["inviteUrl"].rsplit("/", 1)[-1]
+        self.assertEqual(200, app.handler(event("POST", path=f"/invites/{token}", user_id="user-2", body={}), None)["statusCode"])
+        self.assertEqual(409, app.handler(event("POST", path=f"/invites/{token}", user_id="user-1", body={}), None)["statusCode"])
 
     def test_accept_invite_creates_friend_membership(self):
         app = load_app("manage-invites-lambda", self.table)
