@@ -67,10 +67,15 @@ def parse_iso(value):
 
 
 def app_base_url(event):
-    configured = os.environ.get("APP_BASE_URL")
+    configured = os.environ.get("APP_BASE_URL", "").rstrip("/")
+    if configured and configured not in {"http://localhost:3000", "https://localhost:3000"}:
+        return configured
+    headers = event.get("headers") or {}
+    forwarded_origin = headers.get("x-movie-club-app-origin") or headers.get("X-Movie-Club-App-Origin")
+    if forwarded_origin:
+        return forwarded_origin.rstrip("/")
     if configured:
         return configured.rstrip("/")
-    headers = event.get("headers") or {}
     origin = headers.get("origin") or headers.get("Origin")
     return (origin or "http://localhost:3000").rstrip("/")
 
