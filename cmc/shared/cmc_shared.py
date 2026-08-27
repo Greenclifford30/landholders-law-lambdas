@@ -426,6 +426,7 @@ def normalize_movie_snapshot(payload):
         "genres": movie.get("genres") or [],
         "rating": movie.get("rating") or movie.get("voteAverage") or movie.get("vote_average"),
         "popularity": movie.get("popularity"),
+        "status": optional_string(movie, "status"),
     }
 
 

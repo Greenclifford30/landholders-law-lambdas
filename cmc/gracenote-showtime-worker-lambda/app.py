@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo
 
 import boto3
 import requests
+from boto3.dynamodb.conditions import Key
 from botocore.exceptions import ClientError
 
 
@@ -16,6 +17,7 @@ logger.setLevel(os.environ.get("LOG_LEVEL", "INFO").upper())
 
 dynamodb = boto3.resource("dynamodb")
 secretsmanager = boto3.client("secretsmanager")
+ses = boto3.client("ses")
 
 VALID_UNITS = {"mi", "km"}
 RETRYABLE_DDB_CODES = {
@@ -437,13 +439,43 @@ def import_movie_night_candidates(items, message):
     return summary
 
 
+def finish_monitor(message, summary):
+    if not message.get("monitoring"):
+        return
+    app_table = dynamodb.Table(get_required_env("APP_TABLE_NAME"))
+    now = now_iso()
+    monitor_key = {"PK": message["monitorPK"], "SK": message["monitorSK"]}
+    night_key = {"PK": f"CLUB#{message['clubId']}", "SK": f"MOVIE_NIGHT#{message['movieNightId']}"}
+    if summary and summary.get("resultCount", 0):
+        app_table.update_item(
+            Key=night_key,
+            UpdateExpression="SET showtimeMonitoring = :monitoring, updatedAt = :now",
+            ExpressionAttributeValues={":monitoring": {"status": "found", "lastCheckedAt": now, "foundAt": now, "notifiedAt": now, "resultCount": summary["resultCount"]}, ":now": now},
+        )
+        app_table.delete_item(Key=monitor_key)
+        sender = os.environ.get("MOVIE_NIGHT_EMAIL_FROM")
+        if not sender:
+            return
+        members = app_table.query(KeyConditionExpression=Key("PK").eq(f"CLUB#{message['clubId']}") & Key("SK").begins_with("MEMBER#")).get("Items", [])
+        emails = sorted({member.get("email") for member in members if member.get("role") == "admin" and member.get("status", "active") == "active" and member.get("email")})
+        link = f"{os.environ.get('APP_BASE_URL', '').rstrip('/')}/clubs/{message['clubId']}/admin"
+        for email in emails:
+            ses.send_email(Source=sender, Destination={"ToAddresses": [email]}, Message={"Subject": {"Data": f"Showtimes found for {message['movieTitle']}"}, "Body": {"Text": {"Data": f"Showtimes are now available for {message['movieTitle']}. Review {summary['resultCount']} candidate listing(s): {link}"}}})
+        return
+    next_check = (datetime.now(timezone.utc) + timedelta(days=1)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    app_table.delete_item(Key=monitor_key)
+    app_table.put_item(Item={"PK": "SHOWTIME_MONITOR", "SK": f"CHECK#{next_check}#MOVIE_NIGHT#{message['movieNightId']}", "movieNightId": message["movieNightId"], "clubId": message["clubId"], "status": "active", "lastCheckedAt": now, "nextCheckAt": next_check, "createdAt": now, "updatedAt": now})
+    app_table.update_item(Key=night_key, UpdateExpression="SET showtimeMonitoring = :monitoring, updatedAt = :now", ExpressionAttributeValues={":monitoring": {"status": "active", "lastCheckedAt": now, "nextCheckAt": next_check, "resultCount": 0}, ":now": now})
+
+
 def process_record(record):
     message = parse_message(record)
     update_import_state(message, "running")
     response_data = call_gracenote(message)
     items = normalize_items(response_data, message)
     write_items(items)
-    import_movie_night_candidates(items, message)
+    summary = import_movie_night_candidates(items, message)
+    finish_monitor(message, summary)
     logger.info(
         "Stored Gracenote showtime cache records count=%s zip=%s startDate=%s",
         len(items),

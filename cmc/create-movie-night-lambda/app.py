@@ -1,4 +1,5 @@
 from botocore.exceptions import ClientError
+from datetime import datetime, timezone
 from cmc_shared import (
     ADMIN_ROLES,
     ApiError,
@@ -15,6 +16,12 @@ from cmc_shared import (
     response,
     transact_put_items,
 )
+
+
+def should_monitor(movie):
+    release_date = str(movie.get("releaseDate") or "")
+    today = datetime.now(timezone.utc).date().isoformat()
+    return movie.get("status") == "coming_soon" or bool(release_date and release_date > today)
 
 
 @handle
@@ -50,6 +57,20 @@ def handler(event, context):
         "createdBy": user["userId"],
         "updatedAt": created_at,
     }
+    monitor_item = None
+    if should_monitor(movie):
+        monitoring = {"status": "active", "nextCheckAt": created_at, "resultCount": 0}
+        item["showtimeMonitoring"] = monitoring
+        monitor_item = {
+            "PK": "SHOWTIME_MONITOR",
+            "SK": f"CHECK#{created_at}#MOVIE_NIGHT#{movie_night_id}",
+            "movieNightId": movie_night_id,
+            "clubId": club_id,
+            "status": "active",
+            "nextCheckAt": created_at,
+            "createdAt": created_at,
+            "updatedAt": created_at,
+        }
     pointer_item = {
         "PK": club_pk(club_id),
         "SK": "ACTIVE_MOVIE_NIGHT",
@@ -67,6 +88,7 @@ def handler(event, context):
                     "Item": item,
                     "ConditionExpression": "attribute_not_exists(PK) AND attribute_not_exists(SK)",
                 },
+                *([{"Item": monitor_item, "ConditionExpression": "attribute_not_exists(PK) AND attribute_not_exists(SK)"}] if monitor_item else []),
                 {
                     "Item": pointer_item,
                     "ConditionExpression": (

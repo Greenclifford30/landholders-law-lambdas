@@ -35,6 +35,22 @@ CLOSED_STATUSES = {"confirmed", "completed", "cancelled"}
 sqs = boto3.client("sqs")
 
 
+def is_upcoming_movie(movie):
+    release_date = str((movie or {}).get("releaseDate") or "")
+    return (movie or {}).get("status") == "coming_soon" or bool(release_date and release_date > datetime.now(timezone.utc).date().isoformat())
+
+
+def sync_showtime_monitor(movie_night, movie, updated_at):
+    monitors = table().query(KeyConditionExpression=Key("PK").eq("SHOWTIME_MONITOR")).get("Items", [])
+    for monitor in monitors:
+        if monitor.get("movieNightId") == movie_night["movieNightId"]:
+            table().delete_item(Key={"PK": monitor["PK"], "SK": monitor["SK"]})
+    if not is_upcoming_movie(movie):
+        return {"status": "disabled"}
+    table().put_item(Item={"PK": "SHOWTIME_MONITOR", "SK": f"CHECK#{updated_at}#MOVIE_NIGHT#{movie_night['movieNightId']}", "movieNightId": movie_night["movieNightId"], "clubId": movie_night["clubId"], "status": "active", "nextCheckAt": updated_at, "createdAt": updated_at, "updatedAt": updated_at})
+    return {"status": "active", "nextCheckAt": updated_at, "resultCount": 0}
+
+
 def dynamodb_value(value):
     if isinstance(value, float):
         return Decimal(str(value))
@@ -292,6 +308,7 @@ def handle_update_planning(movie_night, payload):
             fields.update(
                 {
                     "movie": movie,
+                    "showtimeMonitoring": sync_showtime_monitor(movie_night, movie, updated_at),
                     "showtimeImportStatus": "idle",
                     "lastShowtimeImportSummary": {},
                 }
