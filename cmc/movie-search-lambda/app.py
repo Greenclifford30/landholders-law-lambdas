@@ -1,5 +1,6 @@
 import json
 import os
+from datetime import datetime, timezone
 
 import boto3
 import requests
@@ -85,6 +86,24 @@ def is_discovery_request(event):
     return path.rstrip("/").endswith("/movies/discover")
 
 
+def discover_movies(mode, page):
+    if mode == "now-playing":
+        return tmdb_get("/movie/now_playing", {"page": page, "region": "US"})
+    # TMDB's /movie/upcoming feed retains some recently released titles. The
+    # discover endpoint lets us strictly require a future theatrical date.
+    return tmdb_get(
+        "/discover/movie",
+        {
+            "page": page,
+            "region": "US",
+            "include_adult": "false",
+            "include_video": "false",
+            "sort_by": "primary_release_date.asc",
+            "primary_release_date.gte": datetime.now(timezone.utc).date().isoformat(),
+        },
+    )
+
+
 @handle
 def handler(event, context):
     claims(event)
@@ -93,18 +112,16 @@ def handler(event, context):
         mode = query_param(event, "mode", "now-playing")
         if mode not in {"now-playing", "coming-soon"}:
             raise ApiError(400, "mode must be now-playing or coming-soon.")
-        endpoint = "/movie/now_playing" if mode == "now-playing" else "/movie/upcoming"
         status = "now_playing" if mode == "now-playing" else "coming_soon"
-        data = tmdb_get(endpoint, {"page": page})
+        data = discover_movies(mode, page)
         return response(200, {"results": [normalize_movie(movie, status) for movie in data.get("results", [])]})
 
     if is_discovery_request(event):
         mode = query_param(event, "mode", "now-playing")
         if mode not in {"now-playing", "coming-soon"}:
             raise ApiError(400, "mode must be now-playing or coming-soon.")
-        endpoint = "/movie/now_playing" if mode == "now-playing" else "/movie/upcoming"
         status = "now_playing" if mode == "now-playing" else "coming_soon"
-        data = tmdb_get(endpoint, {"page": page})
+        data = discover_movies(mode, page)
         return response(200, {"results": [normalize_movie(movie, status) for movie in data.get("results", [])]})
 
     query = query_param(event, "query") or query_param(event, "q")

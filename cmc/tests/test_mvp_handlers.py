@@ -494,6 +494,18 @@ class MvpHandlerTests(unittest.TestCase):
         self.assertEqual("/movie/now_playing", fake_get.call_args.args[0].rsplit("/3", 1)[1])
         self.assertEqual("2", fake_get.call_args.kwargs["params"]["page"])
 
+    def test_coming_soon_excludes_already_released_movies(self):
+        app = load_app("movie-search-lambda", self.table)
+        with patch.object(app.requests, "get") as fake_get:
+            fake_get.return_value.status_code = 200
+            fake_get.return_value.json.return_value = {"results": [{"id": 3, "title": "Resident Evil", "release_date": "2026-09-11"}]}
+            result = app.handler(event(path="/movies/now-playing", query={"mode": "coming-soon"}), None)
+        self.assertEqual(200, result["statusCode"])
+        self.assertEqual("coming_soon", body(result)["results"][0]["status"])
+        self.assertEqual("/discover/movie", fake_get.call_args.args[0].rsplit("/3", 1)[1])
+        self.assertIn("primary_release_date.gte", fake_get.call_args.kwargs["params"])
+        self.assertEqual("primary_release_date.asc", fake_get.call_args.kwargs["params"]["sort_by"])
+
     def test_create_movie_night_requires_admin_and_creates_active_pointer(self):
         app = load_app("create-movie-night-lambda", self.table)
         result = app.handler(
@@ -519,6 +531,25 @@ class MvpHandlerTests(unittest.TestCase):
         self.assertEqual("2026-06-01", stored_night["dateWindowEnd"])
         self.assertEqual("America/Chicago", stored_night["timezone"])
         self.assertEqual("idle", stored_night["showtimeImportStatus"])
+
+    def test_create_upcoming_movie_night_starts_showtime_monitoring(self):
+        app = load_app("create-movie-night-lambda", self.table)
+        result = app.handler(
+            event(
+                "POST",
+                club_id="club-1",
+                body={
+                    "targetDate": "2099-06-01",
+                    "movie": {"externalId": "1", "title": "Future Film", "releaseDate": "2099-06-01", "status": "coming_soon"},
+                },
+            ),
+            None,
+        )
+        self.assertEqual(201, result["statusCode"])
+        movie_night_id = body(result)["movieNight"]["movieNightId"]
+        night = self.table.items[("CLUB#club-1", f"MOVIE_NIGHT#{movie_night_id}")]
+        self.assertEqual("active", night["showtimeMonitoring"]["status"])
+        self.assertTrue(any(item.get("movieNightId") == movie_night_id for item in self.table.items.values()))
 
     def test_create_movie_night_duplicate_id_returns_conflict(self):
         self.table.put_item(
