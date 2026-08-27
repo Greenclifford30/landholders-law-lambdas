@@ -498,13 +498,13 @@ class MvpHandlerTests(unittest.TestCase):
         app = load_app("movie-search-lambda", self.table)
         with patch.object(app.requests, "get") as fake_get:
             fake_get.return_value.status_code = 200
-            fake_get.return_value.json.return_value = {"results": [{"id": 3, "title": "Resident Evil", "release_date": "2026-09-11"}]}
+            fake_get.return_value.json.return_value = {"results": [{"id": 3, "title": "Resident Evil", "release_date": "2026-09-11"}, {"id": 4, "title": "Released Film", "release_date": "2020-01-01"}]}
             result = app.handler(event(path="/movies/now-playing", query={"mode": "coming-soon"}), None)
         self.assertEqual(200, result["statusCode"])
         self.assertEqual("coming_soon", body(result)["results"][0]["status"])
-        self.assertEqual("/discover/movie", fake_get.call_args.args[0].rsplit("/3", 1)[1])
-        self.assertIn("primary_release_date.gte", fake_get.call_args.kwargs["params"])
-        self.assertEqual("primary_release_date.asc", fake_get.call_args.kwargs["params"]["sort_by"])
+        self.assertEqual(["Resident Evil"], [movie["title"] for movie in body(result)["results"]])
+        self.assertEqual("/movie/upcoming", fake_get.call_args.args[0].rsplit("/3", 1)[1])
+        self.assertEqual("US", fake_get.call_args.kwargs["params"]["region"])
 
     def test_create_movie_night_requires_admin_and_creates_active_pointer(self):
         app = load_app("create-movie-night-lambda", self.table)

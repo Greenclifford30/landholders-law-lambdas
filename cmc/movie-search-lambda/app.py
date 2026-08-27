@@ -89,19 +89,15 @@ def is_discovery_request(event):
 def discover_movies(mode, page):
     if mode == "now-playing":
         return tmdb_get("/movie/now_playing", {"page": page, "region": "US"})
-    # TMDB's /movie/upcoming feed retains some recently released titles. The
-    # discover endpoint lets us strictly require a future theatrical date.
-    return tmdb_get(
-        "/discover/movie",
-        {
-            "page": page,
-            "region": "US",
-            "include_adult": "false",
-            "include_video": "false",
-            "sort_by": "primary_release_date.asc",
-            "primary_release_date.gte": datetime.now(timezone.utc).date().isoformat(),
-        },
-    )
+    data = tmdb_get("/movie/upcoming", {"page": page, "region": "US"})
+    today = datetime.now(timezone.utc).date().isoformat()
+    # The regional theatrical feed is useful for relevance, but TMDB can keep
+    # stale records in it. Enforce the user-facing promise locally.
+    data["results"] = [
+        movie for movie in data.get("results", [])
+        if str(movie.get("release_date") or "") >= today
+    ]
+    return data
 
 
 @handle
