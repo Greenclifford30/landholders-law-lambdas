@@ -221,8 +221,11 @@ class FakeSecrets:
 class FakeCognito:
     def __init__(self):
         self.group_additions = []
+        self.failure = None
 
     def admin_add_user_to_group(self, **kwargs):
+        if self.failure:
+            raise self.failure
         self.group_additions.append(kwargs)
         return {}
 
@@ -454,6 +457,47 @@ class MvpHandlerTests(unittest.TestCase):
         accepted = app.handler(event("POST", path=f"/invites/{token}", user_id="joiner", body={}), None)
         self.assertEqual(200, accepted["statusCode"])
         self.assertEqual("friend", self.table.items[("CLUB#club-1", "MEMBER#joiner")]["role"])
+
+    def test_cognito_failure_keeps_invite_pending_without_membership_and_can_retry(self):
+        app = load_app("manage-invites-lambda", self.table)
+        created = app.handler(event("POST", club_id="club-1", body={"emails": ["joiner@example.com"]}), None)
+        token = body(created)["invites"][0]["inviteUrl"].rsplit("/", 1)[-1]
+        app.cognito.failure = FakeClientError(
+            {"Error": {"Code": "UserNotFoundException", "Message": "missing user"}},
+            "AdminAddUserToGroup",
+        )
+
+        failed = app.handler(event("POST", path=f"/invites/{token}", user_id="joiner", body={}), None)
+
+        self.assertEqual(500, failed["statusCode"])
+        self.assertNotIn(("CLUB#club-1", "MEMBER#joiner"), self.table.items)
+        invite = next(item for item in self.table.items.values() if item.get("inviteId") == body(created)["invites"][0]["inviteId"])
+        self.assertEqual("pending", invite["status"])
+
+        app.cognito.failure = None
+        retried = app.handler(event("POST", path=f"/invites/{token}", user_id="joiner", body={}), None)
+        self.assertEqual(200, retried["statusCode"])
+        self.assertIn(("CLUB#club-1", "MEMBER#joiner"), self.table.items)
+        self.assertEqual("accepted", invite["status"])
+
+    def test_dynamodb_failure_keeps_invite_pending_without_membership_and_can_retry(self):
+        app = load_app("manage-invites-lambda", self.table)
+        created = app.handler(event("POST", club_id="club-1", body={"emails": ["joiner@example.com"]}), None)
+        token = body(created)["invites"][0]["inviteUrl"].rsplit("/", 1)[-1]
+        self.table.fail_transact = True
+
+        failed = app.handler(event("POST", path=f"/invites/{token}", user_id="joiner", body={}), None)
+
+        self.assertEqual(500, failed["statusCode"])
+        self.assertNotIn(("CLUB#club-1", "MEMBER#joiner"), self.table.items)
+        invite = next(item for item in self.table.items.values() if item.get("inviteId") == body(created)["invites"][0]["inviteId"])
+        self.assertEqual("pending", invite["status"])
+
+        self.table.fail_transact = False
+        retried = app.handler(event("POST", path=f"/invites/{token}", user_id="joiner", body={}), None)
+        self.assertEqual(200, retried["statusCode"])
+        self.assertIn(("CLUB#club-1", "MEMBER#joiner"), self.table.items)
+        self.assertEqual("accepted", invite["status"])
 
     def test_accept_invite_rejects_wrong_email(self):
         app = load_app("manage-invites-lambda", self.table)
