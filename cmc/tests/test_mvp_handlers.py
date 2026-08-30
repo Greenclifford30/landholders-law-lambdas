@@ -266,12 +266,14 @@ def load_app(lambda_dir, fake_table):
     return module
 
 
-def event(method="GET", path=None, body=None, user_id="user-1", club_id=None, movie_night_id=None, query=None, groups="Admin", headers=None):
+def event(method="GET", path=None, body=None, user_id="user-1", club_id=None, movie_night_id=None, invite_id=None, query=None, groups="Admin", headers=None):
     path_params = {}
     if club_id:
         path_params["clubId"] = club_id
     if movie_night_id:
         path_params["movieNightId"] = movie_night_id
+    if invite_id:
+        path_params["inviteId"] = invite_id
     if path and "/invites/" in path:
         parts = [part for part in path.split("/") if part]
         path_params["token"] = parts[1]
@@ -512,6 +514,53 @@ class MvpHandlerTests(unittest.TestCase):
         result = app.handler(event("GET", club_id="club-1"), None)
         self.assertEqual(200, result["statusCode"])
         self.assertEqual(["pending@example.com"], [invite["email"] for invite in body(result)["invites"]])
+
+    def test_club_admin_can_list_active_members(self):
+        app = load_app("manage-invites-lambda", self.table)
+        self.table.put_item(Item={
+            "PK": "CLUB#club-1", "SK": "MEMBER#removed", "clubId": "club-1", "userId": "removed",
+            "email": "removed@example.com", "role": "friend", "status": "removed",
+        })
+        result = app.handler(event("GET", path="/clubs/club-1/members", club_id="club-1"), None)
+        self.assertEqual(200, result["statusCode"])
+        self.assertEqual(["user-1", "user-2"], [member["userId"] for member in body(result)["members"]])
+
+    def test_non_admin_cannot_list_members_or_revoke_invites(self):
+        app = load_app("manage-invites-lambda", self.table)
+        created = app.handler(event("POST", club_id="club-1", body={"emails": ["pending@example.com"]}), None)
+        invite_id = body(created)["invites"][0]["inviteId"]
+        members = app.handler(event("GET", path="/clubs/club-1/members", club_id="club-1", user_id="user-2", groups="Friend"), None)
+        revoked = app.handler(event("DELETE", path=f"/clubs/club-1/invites/{invite_id}", club_id="club-1", invite_id=invite_id, user_id="user-2", groups="Friend"), None)
+        self.assertEqual(403, members["statusCode"])
+        self.assertEqual(403, revoked["statusCode"])
+
+    def test_admin_can_revoke_one_pending_invite_and_link_cannot_be_accepted(self):
+        app = load_app("manage-invites-lambda", self.table)
+        created = app.handler(event("POST", club_id="club-1", body={"emails": ["pending@example.com"]}), None)
+        invite = body(created)["invites"][0]
+        token = invite["inviteUrl"].rsplit("/", 1)[-1]
+        revoked = app.handler(event("DELETE", path=f"/clubs/club-1/invites/{invite['inviteId']}", club_id="club-1", invite_id=invite["inviteId"]), None)
+        self.assertEqual(200, revoked["statusCode"])
+        self.assertEqual("revoked", body(revoked)["status"])
+        listed = app.handler(event("GET", club_id="club-1"), None)
+        self.assertEqual([], body(listed)["invites"])
+        accepted = app.handler(event("POST", path=f"/invites/{token}", user_id="pending", body={}), None)
+        self.assertEqual(409, accepted["statusCode"])
+
+    def test_admin_can_clear_all_pending_invites_without_changing_accepted_invites(self):
+        app = load_app("manage-invites-lambda", self.table)
+        first = body(app.handler(event("POST", club_id="club-1", body={"emails": ["first@example.com"]}), None))["invites"][0]
+        second = body(app.handler(event("POST", club_id="club-1", body={"emails": ["second@example.com"]}), None))["invites"][0]
+        accepted = body(app.handler(event("POST", club_id="club-1", body={"emails": ["accepted@example.com"]}), None))["invites"][0]
+        accepted_token = accepted["inviteUrl"].rsplit("/", 1)[-1]
+        self.assertEqual(200, app.handler(event("POST", path=f"/invites/{accepted_token}", user_id="accepted", body={}), None)["statusCode"])
+
+        cleared = app.handler(event("DELETE", path="/clubs/club-1/invites", club_id="club-1"), None)
+        self.assertEqual(200, cleared["statusCode"])
+        self.assertEqual(2, body(cleared)["revokedCount"])
+        self.assertEqual("revoked", next(item for item in self.table.items.values() if item.get("inviteId") == first["inviteId"])["status"])
+        self.assertEqual("revoked", next(item for item in self.table.items.values() if item.get("inviteId") == second["inviteId"])["status"])
+        self.assertEqual("accepted", next(item for item in self.table.items.values() if item.get("inviteId") == accepted["inviteId"])["status"])
 
     def test_movie_search_returns_normalized_tmdb_results(self):
         app = load_app("movie-search-lambda", self.table)

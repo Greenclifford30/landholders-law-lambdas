@@ -20,6 +20,7 @@ from cmc_shared import (
     parse_body,
     path_param,
     public_movie_night,
+    query_items,
     require_membership,
     response,
     table,
@@ -248,6 +249,81 @@ def list_invites(event):
     return response(200, {"invites": sorted(invites, key=lambda invite: invite.get("createdAt", ""), reverse=True)})
 
 
+def list_members(event):
+    club_id = path_param(event, "clubId")
+    user = claims(event)
+    require_membership(club_id, user["userId"], ADMIN_ROLES)
+    memberships = [
+        public_movie_night(membership)
+        for membership in query_items(club_pk(club_id), "MEMBER#")
+        if membership.get("status", "active") == "active"
+    ]
+    memberships.sort(key=lambda membership: ((membership.get("name") or membership.get("email") or "").lower(), membership["userId"]))
+    return response(200, {"members": memberships})
+
+
+def revoke_invite(club_id, invite_id, updated_at):
+    invite = table().get_item(Key={"PK": club_pk(club_id), "SK": f"INVITE#{invite_id}"}).get("Item")
+    if not invite:
+        raise ApiError(404, "Invite not found.")
+    if invite.get("status") != "pending":
+        raise ApiError(409, "Invite is no longer pending.")
+    try:
+        table().update_item(
+            Key={"PK": invite["PK"], "SK": invite["SK"]},
+            ConditionExpression="#status = :pending",
+            UpdateExpression="SET #status = :revoked, updatedAt = :updatedAt, GSI1PK = :gsi1pk",
+            ExpressionAttributeNames={"#status": "status"},
+            ExpressionAttributeValues={
+                ":pending": "pending",
+                ":revoked": "revoked",
+                ":updatedAt": updated_at,
+                ":gsi1pk": f"CLUB#{club_id}#INVITES#revoked",
+            },
+        )
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+            raise ApiError(409, "Invite is no longer pending.") from exc
+        raise
+
+
+def revoke_invite_by_id(event):
+    club_id = path_param(event, "clubId")
+    user = claims(event)
+    require_membership(club_id, user["userId"], ADMIN_ROLES)
+    invite_id = path_param(event, "inviteId")
+    revoke_invite(club_id, invite_id, now_iso())
+    return response(200, {"inviteId": invite_id, "status": "revoked"})
+
+
+def revoke_all_invites(event):
+    club_id = path_param(event, "clubId")
+    user = claims(event)
+    require_membership(club_id, user["userId"], ADMIN_ROLES)
+    pending = []
+    query_args = {
+        "IndexName": "GSI1",
+        "KeyConditionExpression": Key("GSI1PK").eq(f"CLUB#{club_id}#INVITES#pending"),
+    }
+    while True:
+        result = table().query(**query_args)
+        pending.extend(result.get("Items", []))
+        last_key = result.get("LastEvaluatedKey")
+        if not last_key:
+            break
+        query_args["ExclusiveStartKey"] = last_key
+    revoked_count = 0
+    updated_at = now_iso()
+    for invite in pending:
+        try:
+            revoke_invite(club_id, invite["inviteId"], updated_at)
+            revoked_count += 1
+        except ApiError as exc:
+            if exc.status != 409:
+                raise
+    return response(200, {"revokedCount": revoked_count})
+
+
 def get_invite(event):
     token = path_param(event, "token")
     invite = find_invite_by_token(token)
@@ -321,9 +397,17 @@ def accept_invite(event):
 @handle
 def handler(event, context):
     method = (event.get("httpMethod") or event.get("requestContext", {}).get("http", {}).get("method") or "GET").upper()
-    if method == "POST" and (event.get("pathParameters") or {}).get("clubId"):
+    path_params = event.get("pathParameters") or {}
+    path = event.get("path") or ""
+    if method == "GET" and path_params.get("clubId") and path.endswith("/members"):
+        return list_members(event)
+    if method == "DELETE" and path_params.get("inviteId"):
+        return revoke_invite_by_id(event)
+    if method == "DELETE" and path_params.get("clubId"):
+        return revoke_all_invites(event)
+    if method == "POST" and path_params.get("clubId"):
         return create_invites(event)
-    if method == "GET" and (event.get("pathParameters") or {}).get("clubId"):
+    if method == "GET" and path_params.get("clubId"):
         return list_invites(event)
     if method == "POST":
         return accept_invite(event)
