@@ -16,6 +16,7 @@ def public_preferences(item):
         "defaultZipCode": item.get("defaultZipCode", ""),
         "defaultRadiusMiles": item.get("defaultRadiusMiles", 25),
         "preferredFormats": item.get("preferredFormats", []),
+        "reminderEmailsEnabled": item.get("reminderEmailsEnabled", True),
         "updatedAt": item.get("updatedAt"),
     }
 
@@ -55,6 +56,9 @@ def update_preferences(event, user_id):
             normalized_formats.append(value)
 
     updated_at = now_iso()
+    reminder_emails_enabled = payload.get("reminderEmailsEnabled", True)
+    if not isinstance(reminder_emails_enabled, bool):
+        raise ApiError(400, "reminderEmailsEnabled must be a boolean.")
     item = {
         "PK": preferences_pk(user_id),
         "SK": PREFERENCES_SK,
@@ -63,6 +67,7 @@ def update_preferences(event, user_id):
         "defaultZipCode": zip_code,
         "defaultRadiusMiles": radius,
         "preferredFormats": normalized_formats,
+        "reminderEmailsEnabled": reminder_emails_enabled,
         "updatedAt": updated_at,
     }
     put_item(item)

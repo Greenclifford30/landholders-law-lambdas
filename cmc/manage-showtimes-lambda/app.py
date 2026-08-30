@@ -29,6 +29,7 @@ from cmc_shared import (
     response,
     table,
 )
+from cmc_notifications import enqueue_movie_notification
 
 
 CLOSED_STATUSES = {"confirmed", "completed", "cancelled"}
@@ -522,6 +523,7 @@ def handle_open_voting(movie_night, payload):
     }
     updated = update_movie_night(movie_night, fields)
     update_active_pointer(movie_night, {"status": "voting", "updatedAt": updated_at})
+    enqueue_movie_notification(updated, "voting_open")
     return response(200, {"movieNight": public_movie_night(updated), "showtimes": [public_movie_night(item) for item in approved]})
 
 

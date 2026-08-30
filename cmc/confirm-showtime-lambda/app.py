@@ -15,6 +15,7 @@ from cmc_shared import (
     transact_update_items,
     voting_is_closed,
 )
+from cmc_notifications import enqueue_movie_notification
 
 
 @handle
@@ -110,6 +111,7 @@ def handler(event, context):
         "calendarSequence": sequence,
         "updatedAt": updated_at,
     }
+    enqueue_movie_notification(updated_movie_night, "showtime_confirmed" if is_initial_confirmation else "showtime_changed")
     return confirmation_response(updated_movie_night)
 
 

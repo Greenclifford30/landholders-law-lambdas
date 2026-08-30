@@ -73,6 +73,7 @@ cp *.py build/ 2>/dev/null || echo "No Python files to copy"
 
 if [ "$PROJECT" = "cmc" ] && [ -f "../shared/cmc_shared.py" ]; then
   cp ../shared/cmc_shared.py build/
+  [ -f "../shared/cmc_notifications.py" ] && cp ../shared/cmc_notifications.py build/
 fi
 
 # Copy any additional files if they exist
