@@ -1,10 +1,35 @@
 from boto3.dynamodb.conditions import Key
 
-from cmc_shared import ApiError, claims, get_item, handle, now_iso, path_param, put_item, response, table
+from cmc_notifications import trigger_notification_delivery
+from cmc_shared import ADMIN_ROLES, ApiError, claims, new_id, now_iso, parse_body, put_item, require_membership, response, table
 
 
 def public_notification(item):
     return {key: value for key, value in item.items() if key not in {"PK", "SK", "GSI1PK", "GSI1SK", "emailStatus", "emailError"}}
+
+
+def enqueue_test_notification(user, event):
+    payload = parse_body(event)
+    club_id = str(payload.get("clubId") or "").strip()
+    if not club_id:
+        raise ApiError(400, "clubId is required.")
+    require_membership(club_id, user["userId"], ADMIN_ROLES)
+    event_id = new_id("notification_test")
+    put_item({
+        "PK": "NOTIFICATION_OUTBOX",
+        "SK": f"EVENT#{event_id}",
+        "entityType": "notificationOutbox",
+        "eventId": event_id,
+        "notificationType": "test_notification",
+        "clubId": club_id,
+        "movieNightId": event_id,
+        "movieTitle": "Chicago Movie Club",
+        "targetUserId": user["userId"],
+        "createdAt": now_iso(),
+        "status": "pending",
+    })
+    trigger_notification_delivery()
+    return response(202, {"eventId": event_id, "message": "Test notification queued for your account."})
 
 
 @handle
@@ -23,6 +48,8 @@ def handler(event, context):
             if not item.get("readAt"):
                 table().update_item(Key={"PK": item["PK"], "SK": item["SK"]}, UpdateExpression="SET readAt = :readAt", ExpressionAttributeValues={":readAt": read_at})
         return response(200, {"readAt": read_at})
+    if method == "POST" and notification_id == "test":
+        return enqueue_test_notification(user, event)
     if method == "POST" and notification_id:
         item = get_item(f"USER#{user['userId']}", f"NOTIFICATION#{notification_id}")
         if not item:

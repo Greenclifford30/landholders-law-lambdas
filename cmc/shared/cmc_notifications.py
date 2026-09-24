@@ -1,6 +1,8 @@
 """Durable Movie Club notification records and outbox helpers."""
+import os
 from datetime import timedelta
 
+import boto3
 from botocore.exceptions import ClientError
 
 from cmc_shared import now_iso, parse_iso_datetime, put_item
@@ -39,7 +41,21 @@ def enqueue_movie_notification(movie_night, notification_type):
     except ClientError as exc:
         if exc.response.get("Error", {}).get("Code") != "ConditionalCheckFailedException":
             raise
+        return
     schedule_reminder(movie_night, notification_type, created_at)
+    trigger_notification_delivery()
+
+
+def trigger_notification_delivery():
+    """Request immediate best-effort delivery; the scheduled worker remains the fallback."""
+    worker_name = os.environ.get("NOTIFICATION_WORKER_FUNCTION_NAME")
+    if not worker_name:
+        return
+    try:
+        boto3.client("lambda").invoke(FunctionName=worker_name, InvocationType="Event", Payload=b"{}")
+    except Exception:
+        # The outbox record remains pending for the scheduled worker to retry.
+        return
 
 
 def schedule_reminder(movie_night, notification_type, created_at=None):
