@@ -81,6 +81,12 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v3
 
+      # Packages with native extensions must be built for the Lambda runtime.
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.13'
+
       - name: Check if folder changed
         id: check_changes
         run: |
