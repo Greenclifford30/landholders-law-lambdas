@@ -1,7 +1,7 @@
 from boto3.dynamodb.conditions import Key
 
 from cmc_notifications import trigger_notification_delivery
-from cmc_shared import ADMIN_ROLES, ApiError, claims, new_id, now_iso, parse_body, put_item, require_membership, response, table
+from cmc_shared import ADMIN_ROLES, ApiError, claims, handle, new_id, now_iso, parse_body, put_item, require_membership, response, table
 
 
 def public_notification(item):
