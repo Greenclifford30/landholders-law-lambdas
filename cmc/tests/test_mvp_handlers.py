@@ -591,7 +591,7 @@ class MvpHandlerTests(unittest.TestCase):
         app = load_app("movie-search-lambda", self.table)
         with patch.object(app.requests, "get") as fake_get:
             fake_get.return_value.status_code = 200
-            fake_get.return_value.json.return_value = {"results": [{"id": 3, "title": "Resident Evil", "release_date": "2026-09-11"}, {"id": 4, "title": "Released Film", "release_date": "2020-01-01"}]}
+            fake_get.return_value.json.return_value = {"results": [{"id": 3, "title": "Resident Evil", "release_date": "2099-09-11"}, {"id": 4, "title": "Released Film", "release_date": "2020-01-01"}]}
             result = app.handler(event(path="/movies/now-playing", query={"mode": "coming-soon"}), None)
         self.assertEqual(200, result["statusCode"])
         self.assertEqual("coming_soon", body(result)["results"][0]["status"])
