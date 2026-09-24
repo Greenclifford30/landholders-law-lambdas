@@ -86,6 +86,14 @@ zip -r ../lambda.zip . > /dev/null
 
 cd ..
 
+# Browser push signs messages with cryptography via CFFI. A missing native
+# _cffi_backend extension fails only at Lambda import time, so fail the build
+# before deployment when packaging the Movie Club notification worker.
+if [ "$LAMBDA_FOLDER" = "cmc/notification-worker-lambda" ] && ! python -c 'import sys, zipfile; sys.exit(0 if any("_cffi_backend" in name for name in zipfile.ZipFile(sys.argv[1]).namelist()) else 1)' lambda.zip; then
+  echo "Error: notification worker package is missing the CFFI native backend."
+  exit 1
+fi
+
 # Display package info
 PACKAGE_SIZE=$(du -h lambda.zip | cut -f1)
 echo "✓ Lambda build complete!"

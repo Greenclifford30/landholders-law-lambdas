@@ -1,2 +1,5 @@
 boto3
 pywebpush==2.0.3
+# pywebpush/cryptography require this compiled extension at Lambda startup.
+# Keep it explicit so it is included in the deployment zip.
+cffi==1.17.1
