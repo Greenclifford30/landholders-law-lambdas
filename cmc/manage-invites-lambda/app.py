@@ -253,11 +253,15 @@ def list_members(event):
     club_id = path_param(event, "clubId")
     user = claims(event)
     require_membership(club_id, user["userId"], ADMIN_ROLES)
-    memberships = [
-        public_movie_night(membership)
-        for membership in query_items(club_pk(club_id), "MEMBER#")
-        if membership.get("status", "active") == "active"
-    ]
+    memberships = []
+    for membership in query_items(club_pk(club_id), "MEMBER#"):
+        if membership.get("status", "active") != "active":
+            continue
+        public_membership = public_movie_night(membership)
+        preferences = get_item(f"USER#{membership['userId']}", "PREFERENCES") or {}
+        public_membership["reminderEmailsEnabled"] = preferences.get("reminderEmailsEnabled", True)
+        public_membership["pushNotificationsEnabled"] = preferences.get("pushNotificationsEnabled", False)
+        memberships.append(public_membership)
     memberships.sort(key=lambda membership: ((membership.get("name") or membership.get("email") or "").lower(), membership["userId"]))
     return response(200, {"members": memberships})
 
