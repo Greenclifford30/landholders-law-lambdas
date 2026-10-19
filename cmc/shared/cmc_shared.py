@@ -24,10 +24,11 @@ logger = logging.getLogger(__name__)
 
 
 class ApiError(Exception):
-    def __init__(self, status_code, message):
+    def __init__(self, status_code, message, details=None):
         super().__init__(message)
         self.status_code = status_code
         self.message = message
+        self.details = details or {}
 
 
 class DecimalEncoder(json.JSONEncoder):
@@ -71,7 +72,7 @@ def response(status_code, body):
             "Content-Type": "application/json",
             "Access-Control-Allow-Origin": "*",
             "Access-Control-Allow-Headers": "Content-Type,Authorization,X-Amz-Date,X-Api-Key,X-Amz-Security-Token",
-            "Access-Control-Allow-Methods": "GET,POST,PUT,OPTIONS",
+            "Access-Control-Allow-Methods": "GET,POST,PUT,PATCH,DELETE,OPTIONS",
         },
         "body": json.dumps(body, cls=DecimalEncoder),
     }
@@ -82,7 +83,7 @@ def handle(handler_func):
         try:
             return handler_func(event or {}, context)
         except ApiError as exc:
-            return response(exc.status_code, {"error": exc.message})
+            return response(exc.status_code, {"error": exc.message, **exc.details})
         except ClientError as exc:
             error = exc.response.get("Error", {})
             logger.exception(
@@ -161,7 +162,7 @@ def movie_night_pk(movie_night_id):
 
 
 def get_item(pk, sk):
-    return table().get_item(Key={"PK": pk, "SK": sk}).get("Item")
+    return table().get_item(Key={"PK": pk, "SK": sk}, ConsistentRead=True).get("Item")
 
 
 def put_item(item, **kwargs):
@@ -178,7 +179,7 @@ def dynamodb_value(value):
     return value
 
 
-def transact_write_items(puts=None, updates=None):
+def transact_write_items(puts=None, updates=None, deletes=None, checks=None):
     table_name = os.environ.get("APP_TABLE_NAME")
     if not table_name:
         raise ApiError(500, "APP_TABLE_NAME is not configured.")
@@ -213,6 +214,15 @@ def transact_write_items(puts=None, updates=None):
         if update.get("ConditionExpression"):
             transact_update["ConditionExpression"] = update["ConditionExpression"]
         transact_items.append({"Update": transact_update})
+    for action_name, actions in (("Delete", deletes), ("ConditionCheck", checks)):
+        for action in actions or []:
+            entry = {"TableName": table_name, "Key": {k: type_serializer.serialize(v) for k, v in action["Key"].items()}}
+            for option in ("ConditionExpression", "ExpressionAttributeNames"):
+                if option in action:
+                    entry[option] = action[option]
+            if action.get("ExpressionAttributeValues"):
+                entry["ExpressionAttributeValues"] = {k: type_serializer.serialize(dynamodb_value(v)) for k, v in action["ExpressionAttributeValues"].items()}
+            transact_items.append({action_name: entry})
     return dynamodb_client.transact_write_items(TransactItems=transact_items)
 
 
@@ -250,12 +260,12 @@ def query_gsi2_movie_night(movie_night_id):
         Limit=1,
     )
     items = result.get("Items", [])
-    return items[0] if items else None
+    return get_item(items[0]["PK"], items[0]["SK"]) if items else None
 
 
 def require_membership(club_id, user_id, allowed_roles=None):
     item = get_item(club_pk(club_id), f"MEMBER#{user_id}")
-    if not item:
+    if not item or item.get("status", "active") != "active":
         raise ApiError(403, "User is not a member of this club.")
     role = item.get("role")
     if allowed_roles and role not in allowed_roles:
@@ -289,7 +299,10 @@ def require_movie_night_membership(movie_night_id, user_id, allowed_roles=None):
 
 
 def active_pointer(club_id):
-    return get_item(club_pk(club_id), "ACTIVE_MOVIE_NIGHT")
+    # Legacy callers receive a projection selected from real event records.
+    from cmc_events import upcoming_nights
+    nights = upcoming_nights(club_id)
+    return nights[0] if nights else None
 
 
 def get_showtime(movie_night_id, showtime_id):

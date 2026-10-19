@@ -29,6 +29,9 @@ pip install --upgrade -r requirements.txt -t build
 
 # 4) Copy source code into 'build' folder
 cp app.py build/
+if [ -f "../shared/cmc_shared.py" ]; then
+  cp ../shared/*.py build/
+fi
 
 # 5) Create the zip package
 cd build

@@ -12,6 +12,7 @@ from botocore.exceptions import ClientError
 from cmc_shared import (
     ADMIN_ROLES,
     ApiError,
+    get_item,
     claims,
     club_pk,
     handle,

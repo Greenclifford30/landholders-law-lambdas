@@ -3,6 +3,7 @@ import re
 from boto3.dynamodb.conditions import Key
 from botocore.exceptions import ClientError
 
+from cmc_events import upcoming_nights
 from cmc_shared import (
     ApiError,
     claims,
@@ -37,9 +38,14 @@ def list_user_clubs(user_id):
         club_id = membership.get("clubId")
         if not club_id or not str(membership.get("SK", "")).startswith("MEMBER#"):
             continue
+        membership = table().get_item(Key={"PK": club_pk(club_id), "SK": membership["SK"]}, ConsistentRead=True).get("Item")
+        if not membership or membership.get("status", "active") != "active":
+            continue
         club = table().get_item(Key={"PK": club_pk(club_id), "SK": "META"}).get("Item")
         if club:
-            clubs.append(public_club(club, membership))
+            nights = upcoming_nights(club_id)
+            clubs.append({**public_club(club, membership), "activeStatus": nights[0]["status"] if nights else None,
+                          "upcomingNightCount": len(nights), "nextMovieNight": public_club(nights[0]) if nights else None})
     return sorted(clubs, key=lambda club: club.get("name", "").lower())
 
 

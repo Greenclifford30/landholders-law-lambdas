@@ -255,24 +255,6 @@ def update_movie_night(movie_night, fields):
     return {**movie_night, **{key: dynamodb_value(value) for key, value in fields.items()}}
 
 
-def update_active_pointer(movie_night, fields):
-    if not fields:
-        return
-    names = {}
-    values = {}
-    assignments = []
-    for key, value in fields.items():
-        names[f"#{key}"] = key
-        values[f":{key}"] = dynamodb_value(value)
-        assignments.append(f"#{key} = :{key}")
-    table().update_item(
-        Key={"PK": f"CLUB#{movie_night['clubId']}", "SK": "ACTIVE_MOVIE_NIGHT"},
-        UpdateExpression="SET " + ", ".join(assignments),
-        ExpressionAttributeNames=names,
-        ExpressionAttributeValues=values,
-    )
-
-
 def movie_identity(movie):
     movie = movie or {}
     provider = str(movie.get("provider") or movie.get("externalProvider") or "").strip()
@@ -315,7 +297,6 @@ def handle_update_planning(movie_night, payload):
                 }
             )
     updated = update_movie_night(movie_night, fields)
-    update_active_pointer(movie_night, {"targetDate": planning["targetDate"], "updatedAt": updated_at})
     return response(200, {"movieNight": public_movie_night(updated)})
 
 
@@ -522,7 +503,6 @@ def handle_open_voting(movie_night, payload):
         "updatedAt": updated_at,
     }
     updated = update_movie_night(movie_night, fields)
-    update_active_pointer(movie_night, {"status": "voting", "updatedAt": updated_at})
     enqueue_movie_notification(updated, "voting_open")
     return response(200, {"movieNight": public_movie_night(updated), "showtimes": [public_movie_night(item) for item in approved]})
 

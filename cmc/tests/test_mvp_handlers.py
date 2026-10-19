@@ -87,7 +87,7 @@ class FakeTable:
                 "TransactWriteItems",
             )
         for operation in TransactItems:
-            action = operation.get("Put") or operation.get("Update")
+            action = operation.get("Put") or operation.get("Update") or operation.get("Delete") or operation.get("ConditionCheck")
             key = action.get("Item") or action.get("Key")
             existing = self.items.get((key["PK"], key["SK"]))
             condition = action.get("ConditionExpression")
@@ -100,6 +100,11 @@ class FakeTable:
             if "Put" in operation:
                 item = operation["Put"]["Item"]
                 self.items[(item["PK"], item["SK"])] = dict(item)
+            elif "Delete" in operation:
+                key = operation["Delete"]["Key"]
+                self.items.pop((key["PK"], key["SK"]), None)
+            elif "ConditionCheck" in operation:
+                continue
             else:
                 update = operation["Update"]
                 item = self.items[(update["Key"]["PK"], update["Key"]["SK"])]
@@ -122,6 +127,9 @@ class FakeTable:
             status_attr = names.get("#status", "status")
             active_statuses = {values[":planning"], values[":voting"], values[":confirmed"]}
             return existing.get(status_attr) not in active_statuses
+        if condition == "#role = :role AND (attribute_not_exists(#status) OR #status = :active)":
+            values = put["ExpressionAttributeValues"]
+            return bool(existing and existing.get("role") == values[":role"] and existing.get("status", "active") == "active")
         if existing is None:
             return False
         names = put.get("ExpressionAttributeNames") or {}
@@ -132,7 +140,7 @@ class FakeTable:
                 return False
         return True
 
-    def get_item(self, Key):
+    def get_item(self, Key, **kwargs):
         item = self.items.get((Key["PK"], Key["SK"]))
         return {"Item": dict(item)} if item else {}
 
@@ -257,7 +265,8 @@ def install_fake_aws(fake_table):
 
 def load_app(lambda_dir, fake_table):
     install_fake_aws(fake_table)
-    sys.modules.pop("cmc_shared", None)
+    for name in ("cmc_shared", "cmc_events", "cmc_movies", "cmc_proposals", "cmc_notifications"):
+        sys.modules.pop(name, None)
     sys.path.insert(0, str(CMC_DIR / "shared"))
     module_path = CMC_DIR / lambda_dir / "app.py"
     spec = importlib.util.spec_from_file_location(lambda_dir.replace("-", "_"), module_path)
@@ -599,7 +608,7 @@ class MvpHandlerTests(unittest.TestCase):
         self.assertEqual("/movie/upcoming", fake_get.call_args.args[0].rsplit("/3", 1)[1])
         self.assertEqual("US", fake_get.call_args.kwargs["params"]["region"])
 
-    def test_create_movie_night_requires_admin_and_creates_active_pointer(self):
+    def test_create_movie_night_requires_admin_and_is_discoverable(self):
         app = load_app("create-movie-night-lambda", self.table)
         result = app.handler(
             event(
@@ -614,8 +623,7 @@ class MvpHandlerTests(unittest.TestCase):
         )
         self.assertEqual(201, result["statusCode"])
         movie_night_id = body(result)["movieNight"]["movieNightId"]
-        self.assertIn(("CLUB#club-1", "ACTIVE_MOVIE_NIGHT"), self.table.items)
-        self.assertEqual(movie_night_id, self.table.items[("CLUB#club-1", "ACTIVE_MOVIE_NIGHT")]["movieNightId"])
+        self.assertEqual(movie_night_id, sys.modules["cmc_shared"].active_pointer("club-1")["movieNightId"])
         stored_movie = self.table.items[("CLUB#club-1", f"MOVIE_NIGHT#{movie_night_id}")]["movie"]
         self.assertEqual(Decimal("8.5"), stored_movie["rating"])
         self.assertEqual(Decimal("123.4"), stored_movie["popularity"])
@@ -644,7 +652,7 @@ class MvpHandlerTests(unittest.TestCase):
         self.assertEqual("active", night["showtimeMonitoring"]["status"])
         self.assertTrue(any(item.get("movieNightId") == movie_night_id for item in self.table.items.values()))
 
-    def test_create_movie_night_duplicate_id_returns_conflict(self):
+    def test_create_movie_night_allocates_server_id(self):
         self.table.put_item(
             Item={
                 "PK": "CLUB#club-1",
@@ -665,10 +673,11 @@ class MvpHandlerTests(unittest.TestCase):
             ),
             None,
         )
-        self.assertEqual(409, result["statusCode"])
+        self.assertEqual(201, result["statusCode"])
+        self.assertNotEqual("mn-duplicate", body(result)["movieNight"]["movieNightId"])
         self.assertNotIn(("CLUB#club-1", "ACTIVE_MOVIE_NIGHT"), self.table.items)
 
-    def test_create_movie_night_existing_active_pointer_returns_conflict(self):
+    def test_create_movie_night_existing_active_pointer_does_not_block_creation(self):
         self.table.put_item(
             Item={
                 "PK": "CLUB#club-1",
@@ -690,8 +699,8 @@ class MvpHandlerTests(unittest.TestCase):
             ),
             None,
         )
-        self.assertEqual(409, result["statusCode"])
-        self.assertNotIn(("CLUB#club-1", "MOVIE_NIGHT#mn-new"), self.table.items)
+        self.assertEqual(201, result["statusCode"])
+        self.assertIn(("CLUB#club-1", "MOVIE_NIGHT#" + body(result)["movieNight"]["movieNightId"]), self.table.items)
         self.assertEqual("mn-active", self.table.items[("CLUB#club-1", "ACTIVE_MOVIE_NIGHT")]["movieNightId"])
 
     def test_create_movie_night_transaction_failure_does_not_leave_partial_records(self):
@@ -870,7 +879,7 @@ class MvpHandlerTests(unittest.TestCase):
         self.assertEqual(200, result["statusCode"])
         self.assertEqual("voting", body(result)["movieNight"]["status"])
         self.assertEqual("voting", self.table.items[("CLUB#club-1", "MOVIE_NIGHT#mn-1")]["status"])
-        self.assertEqual("voting", self.table.items[("CLUB#club-1", "ACTIVE_MOVIE_NIGHT")]["status"])
+        self.assertEqual("voting", sys.modules["cmc_shared"].active_pointer("club-1")["status"])
         self.assertEqual("2099-06-01T01:00:00Z", body(result)["movieNight"]["votingClosesAt"])
 
     def test_manage_showtimes_open_voting_requires_two_approved(self):
@@ -1238,7 +1247,8 @@ class MvpHandlerTests(unittest.TestCase):
         self.assertEqual("CLUB#club-1#STATUS#completed", movie_night["GSI1PK"])
         self.assertEqual("user-1", movie_night["completedBy"])
         self.assertIn("completedAt", movie_night)
-        self.assertEqual("completed", pointer["status"])
+        self.assertEqual("confirmed", pointer["status"])
+        self.assertIsNone(sys.modules["cmc_shared"].active_pointer("club-1"))
 
     def test_complete_movie_night_rejects_non_confirmed_status(self):
         for status in ("planning", "voting", "completed", "cancelled"):
@@ -1275,8 +1285,7 @@ class MvpHandlerTests(unittest.TestCase):
         movie_night_id = body(create_result)["movieNight"]["movieNightId"]
 
         self.assertEqual(201, create_result["statusCode"])
-        self.assertEqual(movie_night_id, self.table.items[("CLUB#club-1", "ACTIVE_MOVIE_NIGHT")]["movieNightId"])
-        self.assertEqual("planning", self.table.items[("CLUB#club-1", "ACTIVE_MOVIE_NIGHT")]["status"])
+        self.assertEqual(movie_night_id, sys.modules["cmc_shared"].active_pointer("club-1")["movieNightId"])
 
     def test_update_rsvp_requires_confirmed_movie_night(self):
         self.seed_movie_night("confirmed")

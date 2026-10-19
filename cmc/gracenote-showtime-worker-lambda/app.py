@@ -458,7 +458,7 @@ def finish_monitor(message, summary):
             return
         members = app_table.query(KeyConditionExpression=Key("PK").eq(f"CLUB#{message['clubId']}") & Key("SK").begins_with("MEMBER#")).get("Items", [])
         emails = sorted({member.get("email") for member in members if member.get("role") == "admin" and member.get("status", "active") == "active" and member.get("email")})
-        link = f"{os.environ.get('APP_BASE_URL', '').rstrip('/')}/clubs/{message['clubId']}/admin"
+        link = f"{os.environ.get('APP_BASE_URL', '').rstrip('/')}/clubs/{message['clubId']}/movie-nights/{message['movieNightId']}/admin"
         for email in emails:
             ses.send_email(Source=sender, Destination={"ToAddresses": [email]}, Message={"Subject": {"Data": f"Showtimes found for {message['movieTitle']}"}, "Body": {"Text": {"Data": f"Showtimes are now available for {message['movieTitle']}. Review {summary['resultCount']} candidate listing(s): {link}"}}})
         return

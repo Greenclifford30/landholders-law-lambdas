@@ -15,7 +15,6 @@ def handler(event, context):
     try:
         transact_update_items([
             {"Key": {"PK": movie_night["PK"], "SK": movie_night["SK"]}, "UpdateExpression": "SET #status = :status, GSI1PK = :gsi, cancelledAt = :at, cancelledBy = :by, updatedAt = :at", "ExpressionAttributeNames": {"#status": "status"}, "ExpressionAttributeValues": {":status": "cancelled", ":gsi": f"CLUB#{movie_night['clubId']}#STATUS#cancelled", ":at": updated_at, ":by": user["userId"], ":expected": movie_night["status"]}, "ConditionExpression": "#status = :expected"},
-            {"Key": {"PK": f"CLUB#{movie_night['clubId']}", "SK": "ACTIVE_MOVIE_NIGHT"}, "UpdateExpression": "SET #status = :status, updatedAt = :at", "ExpressionAttributeNames": {"#status": "status"}, "ExpressionAttributeValues": {":status": "cancelled", ":at": updated_at, ":id": movie_night_id}, "ConditionExpression": "movieNightId = :id"},
         ])
     except ClientError as exc:
         if exc.response.get("Error", {}).get("Code") == "TransactionCanceledException":

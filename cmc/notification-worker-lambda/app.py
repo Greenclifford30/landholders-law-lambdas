@@ -130,7 +130,7 @@ def send_push(item, subject, body, href, preferences):
 
 def deliver(event):
     subject, body = notification_copy(event)
-    link = f"{os.environ.get('APP_BASE_URL', '').rstrip('/')}/clubs/{event['clubId']}"
+    link = f"{os.environ.get('APP_BASE_URL', '').rstrip('/')}/clubs/{event['clubId']}/movie-nights/{event['movieNightId']}"
     is_reminder = event["notificationType"] in {"vote_reminder", "rsvp_reminder"}
     created_at = now_iso()
     all_channels_delivered = True
@@ -144,7 +144,7 @@ def deliver(event):
             "entityType": "notification", "notificationId": notification_id,
             "userId": user_id, "clubId": event["clubId"], "movieNightId": event["movieNightId"],
             "type": event["notificationType"], "title": subject, "body": body,
-            "href": f"/clubs/{event['clubId']}", "createdAt": created_at,
+            "href": f"/clubs/{event['clubId']}/movie-nights/{event['movieNightId']}", "createdAt": created_at,
             "emailStatus": "pending", "pushStatus": "pending",
         }
         try:

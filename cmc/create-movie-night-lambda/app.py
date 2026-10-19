@@ -1,114 +1,48 @@
+import hashlib
+import json
 from botocore.exceptions import ClientError
-from datetime import datetime, timezone
-from cmc_shared import (
-    ADMIN_ROLES,
-    ApiError,
-    claims,
-    club_pk,
-    handle,
-    new_id,
-    normalize_planning_input,
-    normalize_movie_snapshot,
-    now_iso,
-    parse_body,
-    path_param,
-    require_membership,
-    response,
-    transact_put_items,
-)
-
-
-def should_monitor(movie):
-    release_date = str(movie.get("releaseDate") or "")
-    today = datetime.now(timezone.utc).date().isoformat()
-    return movie.get("status") == "coming_soon" or bool(release_date and release_date > today)
+from cmc_shared import (ADMIN_ROLES, ApiError, claims, handle, normalize_movie_snapshot, parse_body,
+                        path_param, require_membership, response, transact_write_items, public_movie_night, get_item, club_pk)
+from cmc_events import build_night, member_check
 
 
 @handle
 def handler(event, context):
     club_id = path_param(event, "clubId")
     user = claims(event)
-    require_membership(club_id, user["userId"], ADMIN_ROLES)
+    membership = require_membership(club_id, user["userId"], ADMIN_ROLES)
     payload = parse_body(event)
-    movie = normalize_movie_snapshot(payload)
-    planning = normalize_planning_input(payload)
-    target_date = planning.get("targetDate")
-    if not target_date:
-        raise ApiError(400, "targetDate is required.")
-
-    movie_night_id = payload.get("movieNightId") or new_id("mn")
-    created_at = now_iso()
-    item = {
-        "PK": club_pk(club_id),
-        "SK": f"MOVIE_NIGHT#{movie_night_id}",
-        "GSI1PK": f"CLUB#{club_id}#STATUS#planning",
-        "GSI1SK": f"START#{target_date}#MOVIE_NIGHT#{movie_night_id}",
-        "GSI2PK": f"MOVIE_NIGHT#{movie_night_id}",
-        "GSI2SK": "META",
-        "clubId": club_id,
-        "movieNightId": movie_night_id,
-        "status": "planning",
-        "movieSelectionMode": payload.get("movieSelectionMode", "admin_selected"),
-        "movie": movie,
-        **planning,
-        "showtimeImportStatus": "idle",
-        "lastShowtimeImportSummary": {},
-        "createdAt": created_at,
-        "createdBy": user["userId"],
-        "updatedAt": created_at,
-    }
-    monitor_item = None
-    if should_monitor(movie):
-        monitoring = {"status": "active", "nextCheckAt": created_at, "resultCount": 0}
-        item["showtimeMonitoring"] = monitoring
-        monitor_item = {
-            "PK": "SHOWTIME_MONITOR",
-            "SK": f"CHECK#{created_at}#MOVIE_NIGHT#{movie_night_id}",
-            "movieNightId": movie_night_id,
-            "clubId": club_id,
-            "status": "active",
-            "nextCheckAt": created_at,
-            "createdAt": created_at,
-            "updatedAt": created_at,
-        }
-    pointer_item = {
-        "PK": club_pk(club_id),
-        "SK": "ACTIVE_MOVIE_NIGHT",
-        "clubId": club_id,
-        "movieNightId": movie_night_id,
-        "status": "planning",
-        "targetDate": target_date,
-        "updatedAt": created_at,
-    }
-
+    raw_key = payload.get("idempotencyKey")
+    key = None
+    fingerprint = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+    if raw_key is not None:
+        if not isinstance(raw_key, str) or not raw_key.strip() or len(raw_key) > 200:
+            raise ApiError(400, "idempotencyKey must be text up to 200 characters.")
+        key = {"PK": club_pk(club_id), "SK": "CREATE_NIGHT#" + hashlib.sha256(raw_key.encode()).hexdigest()}
+        retry = replay(key, fingerprint)
+        if retry:
+            return response(200, {"movieNight": public_movie_night(retry)})
+    item, puts = build_night(club_id, user["userId"], payload, normalize_movie_snapshot(payload))
+    if key:
+        puts.append({"Item": {**key, "fingerprint": fingerprint, "movieNightId": item["movieNightId"]},
+                     "ConditionExpression": "attribute_not_exists(PK) AND attribute_not_exists(SK)"})
     try:
-        transact_put_items(
-            [
-                {
-                    "Item": item,
-                    "ConditionExpression": "attribute_not_exists(PK) AND attribute_not_exists(SK)",
-                },
-                *([{"Item": monitor_item, "ConditionExpression": "attribute_not_exists(PK) AND attribute_not_exists(SK)"}] if monitor_item else []),
-                {
-                    "Item": pointer_item,
-                    "ConditionExpression": (
-                        "attribute_not_exists(PK) OR NOT (#status IN (:planning, :voting, :confirmed))"
-                    ),
-                    "ExpressionAttributeNames": {"#status": "status"},
-                    "ExpressionAttributeValues": {
-                        ":planning": "planning",
-                        ":voting": "voting",
-                        ":confirmed": "confirmed",
-                    },
-                },
-            ]
-        )
+        transact_write_items(puts=puts, checks=[member_check(club_id, user["userId"], membership)])
     except ClientError as exc:
-        if exc.response.get("Error", {}).get("Code") in {
-            "ConditionalCheckFailedException",
-            "TransactionCanceledException",
-        }:
-            raise ApiError(409, "Movie night already exists or club already has an active movie night.") from exc
+        if exc.response.get("Error", {}).get("Code") == "TransactionCanceledException":
+            require_membership(club_id, user["userId"], ADMIN_ROLES)
+            retry = replay(key, fingerprint) if key else None
+            if retry:
+                return response(200, {"movieNight": public_movie_night(retry)})
+            raise ApiError(409, "Movie night already exists or membership changed.") from exc
         raise
+    return response(201, {"movieNight": public_movie_night(item)})
 
-    return response(201, {"movieNight": {k: v for k, v in item.items() if not k.startswith("GSI") and k not in {"PK", "SK"}}})
+
+def replay(key, fingerprint):
+    record = get_item(key["PK"], key["SK"])
+    if not record:
+        return None
+    if record["fingerprint"] != fingerprint:
+        raise ApiError(409, "Idempotency key was used with different input.")
+    return get_item(key["PK"], f"MOVIE_NIGHT#{record['movieNightId']}")

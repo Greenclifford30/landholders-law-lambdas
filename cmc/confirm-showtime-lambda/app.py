@@ -73,21 +73,6 @@ def handler(event, context):
         movie_update["ConditionExpression"] += " AND confirmedShowtimeId = :expectedShowtimeId"
 
     updates = [movie_update]
-    if is_initial_confirmation:
-        updates.append(
-            {
-                "Key": {"PK": f"CLUB#{movie_night['clubId']}", "SK": "ACTIVE_MOVIE_NIGHT"},
-                "UpdateExpression": "SET #status = :status, updatedAt = :updatedAt",
-                "ExpressionAttributeNames": {"#status": "status"},
-                "ExpressionAttributeValues": {
-                    ":status": "confirmed",
-                    ":expectedStatus": "voting",
-                    ":movieNightId": movie_night_id,
-                    ":updatedAt": updated_at,
-                },
-                "ConditionExpression": "movieNightId = :movieNightId AND #status = :expectedStatus",
-            }
-        )
 
     try:
         transact_update_items(updates)
