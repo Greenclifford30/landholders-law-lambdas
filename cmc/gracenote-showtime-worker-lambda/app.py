@@ -11,6 +11,7 @@ import requests
 from boto3.dynamodb.conditions import Key
 from botocore.exceptions import ClientError
 
+from cmc_email import branded_sender, showtime_results_email
 
 logger = logging.getLogger()
 logger.setLevel(os.environ.get("LOG_LEVEL", "INFO").upper())
@@ -460,7 +461,11 @@ def finish_monitor(message, summary):
         emails = sorted({member.get("email") for member in members if member.get("role") == "admin" and member.get("status", "active") == "active" and member.get("email")})
         link = f"{os.environ.get('APP_BASE_URL', '').rstrip('/')}/clubs/{message['clubId']}/movie-nights/{message['movieNightId']}/admin"
         for email in emails:
-            ses.send_email(Source=sender, Destination={"ToAddresses": [email]}, Message={"Subject": {"Data": f"Showtimes found for {message['movieTitle']}"}, "Body": {"Text": {"Data": f"Showtimes are now available for {message['movieTitle']}. Review {summary['resultCount']} candidate listing(s): {link}"}}})
+            ses.send_email(
+                Source=branded_sender(sender),
+                Destination={"ToAddresses": [email]},
+                Message=showtime_results_email(message.get("movieTitle"), summary["resultCount"], link),
+            )
         return
     next_check = (datetime.now(timezone.utc) + timedelta(days=1)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
     app_table.delete_item(Key=monitor_key)

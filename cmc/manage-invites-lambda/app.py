@@ -9,6 +9,7 @@ import boto3
 from boto3.dynamodb.conditions import Key
 from botocore.exceptions import ClientError
 
+from cmc_email import branded_sender, invitation_email
 from cmc_shared import (
     ADMIN_ROLES,
     ApiError,
@@ -101,16 +102,9 @@ def send_invite_email(email, club, token, event):
     link = f"{app_base_url(event)}/invites/{token}"
     club_name = club.get("name") or "Movie Club"
     ses.send_email(
-        Source=source,
+        Source=branded_sender(source),
         Destination={"ToAddresses": [email]},
-        Message={
-            "Subject": {"Data": f"You're invited to {club_name}"},
-            "Body": {
-                "Text": {
-                    "Data": f"You have been invited to join {club_name} on Movie Club.\n\nAccept your invite: {link}\n\nThis invite expires in 14 days."
-                }
-            },
-        },
+        Message=invitation_email(club_name, link),
     )
 
 

@@ -4,7 +4,7 @@ import sys
 import types
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 
 class FakeTable:
@@ -56,11 +56,15 @@ def load_app():
     )
 
     sys.modules["boto3"] = fake_boto3
+    fake_conditions = types.SimpleNamespace(Key=Mock())
+    sys.modules["boto3.dynamodb"] = types.SimpleNamespace(conditions=fake_conditions)
+    sys.modules["boto3.dynamodb.conditions"] = fake_conditions
     sys.modules["botocore"] = types.SimpleNamespace(exceptions=fake_botocore_exceptions)
     sys.modules["botocore.exceptions"] = fake_botocore_exceptions
     sys.modules["requests"] = fake_requests
 
     module_path = Path(__file__).with_name("app.py")
+    sys.path.insert(0, str(module_path.parent.parent / "shared"))
     spec = importlib.util.spec_from_file_location("worker_app", module_path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)

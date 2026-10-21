@@ -6,6 +6,7 @@ import boto3
 from boto3.dynamodb.conditions import Key
 from botocore.exceptions import ClientError
 
+from cmc_email import branded_sender, notification_email
 from cmc_events import all_items
 from cmc_shared import list_rsvps, list_votes, now_iso, put_item, table
 from pywebpush import WebPushException, webpush
@@ -40,7 +41,7 @@ def delivery_details(item, channel):
     }
 
 
-def notification_copy(event):
+def notification_copy(event, *, include_plan_details=True):
     title = event.get("movieTitle") or "Movie night"
     kind = event["notificationType"]
     copy = {
@@ -54,9 +55,9 @@ def notification_copy(event):
     }
     subject, body = copy[kind]
     previous = event.get("previousPlan")
-    if previous and kind in {"showtime_changed", "movie_night_cancelled"}:
+    if include_plan_details and previous and kind in {"showtime_changed", "movie_night_cancelled"}:
         body += f" Previous plan: {previous.get('theaterName', '')}, {previous.get('startsAtUtc', '')}, {previous.get('screenFormat', '')}."
-    if kind == "showtime_changed":
+    if include_plan_details and kind == "showtime_changed":
         current = event.get("confirmedShowtime") or {}
         body += f" Current plan: {current.get('theaterName', '')}, {current.get('startsAtUtc', '')}, {current.get('screenFormat', '')}. Review your tickets separately."
     return subject, body
@@ -96,7 +97,7 @@ def update_delivery_status(item, channel, status, error=None):
         log("notification_delivery_status", **details)
 
 
-def send_email(item, member, subject, body, link, is_reminder, preferences):
+def send_email(item, member, subject, body, link, is_reminder, preferences, event):
     source = os.environ.get("NOTIFICATION_EMAIL_FROM")
     if not source:
         update_delivery_status(item, "email", "not_configured")
@@ -105,7 +106,17 @@ def send_email(item, member, subject, body, link, is_reminder, preferences):
         update_delivery_status(item, "email", "disabled")
         return
     try:
-        send_args = {"Source": source, "Destination": {"ToAddresses": [member["email"]]}, "Message": {"Subject": {"Data": subject}, "Body": {"Text": {"Data": f"{body}\n\nOpen Movie Club: {link}"}}}}
+        base_url = os.environ.get("APP_BASE_URL", "").rstrip("/")
+        if event["notificationType"] == "test_notification":
+            link = f"{base_url}/clubs/{event['clubId']}"
+        send_args = {
+            "Source": branded_sender(source),
+            "Destination": {"ToAddresses": [member["email"]]},
+            "Message": notification_email(
+                event, heading=subject, body=body, link=link,
+                preferences_url=f"{base_url}/settings",
+            ),
+        }
         if os.environ.get("NOTIFICATION_EMAIL_CONFIGURATION_SET"):
             send_args["ConfigurationSetName"] = os.environ["NOTIFICATION_EMAIL_CONFIGURATION_SET"]
         response = ses.send_email(**send_args)
@@ -138,6 +149,7 @@ def send_push(item, subject, body, href, preferences):
 
 def deliver(event):
     subject, body = notification_copy(event)
+    _, email_body = notification_copy(event, include_plan_details=False)
     link = f"{os.environ.get('APP_BASE_URL', '').rstrip('/')}/clubs/{event['clubId']}/movie-nights/{event['movieNightId']}"
     is_reminder = event["notificationType"] in {"vote_reminder", "rsvp_reminder"}
     created_at = now_iso()
@@ -170,7 +182,7 @@ def deliver(event):
             continue
         preferences = user_preferences(user_id)
         if item.get("emailStatus") != "sent":
-            send_email(item, member, subject, body, link, is_reminder, preferences)
+            send_email(item, member, subject, email_body, link, is_reminder, preferences, event)
         if item.get("pushStatus") != "sent":
             send_push(item, subject, body, item["href"], preferences)
         refreshed = table().get_item(Key={"PK": item["PK"], "SK": item["SK"]}).get("Item") or item
