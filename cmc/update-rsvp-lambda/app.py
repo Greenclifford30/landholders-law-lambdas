@@ -1,3 +1,6 @@
+from botocore.exceptions import ClientError
+from cmc_events import member_check
+from cmc_lifecycle import revision, version_check
 from cmc_shared import (
     ApiError,
     claims,
@@ -7,7 +10,7 @@ from cmc_shared import (
     parse_body,
     path_param,
     public_movie_night,
-    put_item,
+    transact_write_items,
     require_movie_night_membership,
     response,
 )
@@ -21,10 +24,14 @@ VALID_TICKET_STATUSES = {"not_purchased", "purchased"}
 def handler(event, context):
     movie_night_id = path_param(event, "movieNightId")
     user = claims(event)
-    movie_night, _membership = require_movie_night_membership(movie_night_id, user["userId"])
+    movie_night, membership = require_movie_night_membership(movie_night_id, user["userId"])
     if movie_night.get("status") != "confirmed":
         raise ApiError(409, "RSVP is available after the movie night is confirmed.")
     payload = parse_body(event)
+    current_revision = revision(movie_night)
+    requested_revision = payload.get("planRevision", 1)
+    if type(requested_revision) is not int or requested_revision != current_revision:
+        raise ApiError(409, "The plan changed. Reload before submitting your RSVP and ticket status.")
     status = payload.get("status")
     ticket_status = payload.get("ticketStatus", "not_purchased")
     if status not in VALID_RSVP_STATUSES:
@@ -39,9 +46,16 @@ def handler(event, context):
         "GSI1SK": f"USER#{user['userId']}",
         "movieNightId": movie_night_id,
         "userId": user["userId"],
+        "rsvpPlanRevision": current_revision,
+        "ticketPlanRevision": current_revision,
         "status": status,
         "ticketStatus": ticket_status,
         "updatedAt": updated_at,
     }
-    put_item(item)
+    try:
+        transact_write_items(puts=[{"Item": item}], checks=[version_check(movie_night), member_check(movie_night["clubId"], user["userId"], membership)])
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") == "TransactionCanceledException":
+            raise ApiError(409, "The plan changed. Reload and try again.") from exc
+        raise
     return response(200, {"rsvp": public_movie_night(item)})

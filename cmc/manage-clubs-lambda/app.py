@@ -3,7 +3,7 @@ import re
 from boto3.dynamodb.conditions import Key
 from botocore.exceptions import ClientError
 
-from cmc_events import upcoming_nights
+from cmc_events import upcoming_nights, compatibility_order
 from cmc_shared import (
     ApiError,
     claims,
@@ -43,7 +43,7 @@ def list_user_clubs(user_id):
             continue
         club = table().get_item(Key={"PK": club_pk(club_id), "SK": "META"}).get("Item")
         if club:
-            nights = upcoming_nights(club_id)
+            nights = sorted(upcoming_nights(club_id), key=compatibility_order)
             clubs.append({**public_club(club, membership), "activeStatus": nights[0]["status"] if nights else None,
                           "upcomingNightCount": len(nights), "nextMovieNight": public_club(nights[0]) if nights else None})
     return sorted(clubs, key=lambda club: club.get("name", "").lower())

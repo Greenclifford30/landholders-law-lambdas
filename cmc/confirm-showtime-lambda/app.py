@@ -1,113 +1,53 @@
-from botocore.exceptions import ClientError
+from cmc_shared import (ADMIN_ROLES, ApiError, claims, get_showtime, handle, now_iso, parse_body,
+                        path_param, public_movie_night, require_movie_night_membership, response, voting_is_closed)
+from cmc_lifecycle import check_expected, commit, revision, retry_record, save_noop
 
-from cmc_shared import (
-    ADMIN_ROLES,
-    ApiError,
-    claims,
-    get_showtime,
-    handle,
-    now_iso,
-    parse_body,
-    path_param,
-    public_movie_night,
-    require_movie_night_membership,
-    response,
-    transact_update_items,
-    voting_is_closed,
-)
-from cmc_notifications import enqueue_movie_notification
+
+def material_plan(showtime):
+    from cmc_shared import parse_iso_datetime
+    start = parse_iso_datetime(showtime.get("startsAtUtc") or showtime.get("startsAt"))
+    theater = showtime.get("providerTheaterId") or showtime.get("externalTheaterId") or (
+        str(showtime.get("theaterName") or "").strip().casefold(),
+        str(showtime.get("theaterAddress") or showtime.get("theaterLocation") or "").strip().casefold())
+    return theater, start, str(showtime.get("screenFormat") or "Standard").strip().casefold()
 
 
 @handle
 def handler(event, context):
-    movie_night_id = path_param(event, "movieNightId")
+    identifier = path_param(event, "movieNightId")
     user = claims(event)
-    movie_night, _membership = require_movie_night_membership(movie_night_id, user["userId"], ADMIN_ROLES)
-    current_status = movie_night.get("status")
-    if current_status == "voting" and not voting_is_closed(movie_night):
-        raise ApiError(409, "Voting must be closed before confirming a showtime.")
-    if current_status not in {"voting", "confirmed"}:
-        raise ApiError(409, "Movie night cannot be confirmed from its current state.")
-
+    night, membership = require_movie_night_membership(identifier, user["userId"], ADMIN_ROLES)
     payload = parse_body(event)
-    showtime_id = payload.get("showtimeId") or payload.get("confirmedShowtimeId")
-    if not showtime_id:
-        raise ApiError(400, "showtimeId is required.")
-    showtime = get_showtime(movie_night_id, str(showtime_id))
-    if not showtime:
-        raise ApiError(400, "Selected showtime is not attached to this movie night.")
-    if showtime.get("status", "approved") != "approved":
-        raise ApiError(400, "Selected showtime is not approved for voting.")
-
-    if current_status == "confirmed" and str(movie_night.get("confirmedShowtimeId")) == str(showtime_id):
-        return confirmation_response(movie_night)
-
-    updated_at = now_iso()
-    confirmed_snapshot = public_movie_night(showtime)
-    is_initial_confirmation = current_status == "voting"
-    sequence = 0 if is_initial_confirmation else int(movie_night.get("calendarSequence", 0)) + 1
-    confirmed_at = updated_at if is_initial_confirmation else movie_night.get("confirmedAt") or updated_at
-    movie_update = {
-        "Key": {"PK": movie_night["PK"], "SK": movie_night["SK"]},
-        "UpdateExpression": (
-            "SET #status = :status, GSI1PK = :gsi1pk, confirmedShowtimeId = :showtimeId, "
-            "confirmedShowtime = :showtime, confirmedAt = :confirmedAt, confirmedBy = :confirmedBy, "
-            "calendarSequence = :sequence, updatedAt = :updatedAt"
-        ),
-        "ExpressionAttributeNames": {"#status": "status"},
-        "ExpressionAttributeValues": {
-            ":status": "confirmed",
-            ":expectedStatus": current_status,
-            ":gsi1pk": f"CLUB#{movie_night['clubId']}#STATUS#confirmed",
-            ":showtimeId": str(showtime_id),
-            ":showtime": confirmed_snapshot,
-            ":confirmedAt": confirmed_at,
-            ":confirmedBy": user["userId"],
-            ":sequence": sequence,
-            ":updatedAt": updated_at,
-        },
-        "ConditionExpression": "#status = :expectedStatus",
-    }
-    if not is_initial_confirmation:
-        movie_update["ExpressionAttributeValues"][":expectedShowtimeId"] = str(movie_night.get("confirmedShowtimeId"))
-        movie_update["ConditionExpression"] += " AND confirmedShowtimeId = :expectedShowtimeId"
-
-    updates = [movie_update]
-
-    try:
-        transact_update_items(updates)
-    except ClientError as exc:
-        code = exc.response.get("Error", {}).get("Code")
-        if code == "TransactionCanceledException":
-            latest, _membership = require_movie_night_membership(movie_night_id, user["userId"], ADMIN_ROLES)
-            if latest.get("status") == "confirmed" and str(latest.get("confirmedShowtimeId")) == str(showtime_id):
-                return confirmation_response(latest)
-            raise ApiError(409, "Movie night confirmation changed. Reload and try again.") from exc
-        raise
-
-    updated_movie_night = {
-        **movie_night,
-        "status": "confirmed",
-        "GSI1PK": f"CLUB#{movie_night['clubId']}#STATUS#confirmed",
-        "confirmedShowtimeId": str(showtime_id),
-        "confirmedShowtime": confirmed_snapshot,
-        "confirmedAt": confirmed_at,
-        "confirmedBy": user["userId"],
-        "calendarSequence": sequence,
-        "updatedAt": updated_at,
-    }
-    enqueue_movie_notification(updated_movie_night, "showtime_confirmed" if is_initial_confirmation else "showtime_changed")
-    return confirmation_response(updated_movie_night)
+    retry, previous = retry_record(night, user["userId"], "confirm", payload)
+    if previous:
+        return confirmation_response(previous["result"])
+    check_expected(night, payload)
+    if night["status"] == "voting" and not voting_is_closed(night):
+        raise ApiError(409, "Voting must be closed before confirming a showtime.")
+    if night["status"] not in {"voting", "confirmed"}:
+        raise ApiError(409, "Movie night cannot be confirmed from its current state.")
+    showtime = get_showtime(identifier, str(payload.get("showtimeId") or payload.get("confirmedShowtimeId") or ""))
+    if not showtime or showtime.get("status", "approved") != "approved":
+        raise ApiError(400, "Select an approved showtime attached to this movie night.")
+    snapshot = public_movie_night(showtime)
+    if night["status"] == "confirmed" and material_plan(night.get("confirmedShowtime") or {}) == material_plan(snapshot):
+        save_noop(night, user["userId"], membership, retry)
+        return confirmation_response(night)
+    initial = night["status"] == "voting"
+    reason = payload.get("changeReason")
+    if reason is not None and (not isinstance(reason, str) or len(reason) > 1000):
+        raise ApiError(400, "changeReason must be at most 1000 characters.")
+    updated = {**night, "status": "confirmed", "GSI1PK": f"CLUB#{night['clubId']}#STATUS#confirmed",
+               "confirmedShowtimeId": showtime["showtimeId"], "confirmedShowtime": snapshot,
+               "confirmedAt": night.get("confirmedAt") or now_iso(), "confirmedBy": user["userId"],
+               "planRevision": revision(night) + 1, "calendarSequence": 0 if initial else int(night.get("calendarSequence", 0)) + 1,
+               "previousPlan": None if initial else night.get("confirmedShowtime"), "changeReason": reason}
+    result = commit(night, updated, user["userId"], membership, "confirm", retry,
+                    "showtime_confirmed" if initial else "showtime_changed")
+    return confirmation_response(result)
 
 
-def confirmation_response(movie_night):
-    public = public_movie_night(movie_night)
-    return response(
-        200,
-        {
-            "movieNight": public,
-            "movieNightId": public["movieNightId"],
-            "status": "confirmed",
-            "confirmedShowtime": public.get("confirmedShowtime"),
-        },
-    )
+def confirmation_response(night):
+    public = public_movie_night(night)
+    return response(200, {"movieNight": public, "movieNightId": public["movieNightId"],
+                          "status": public["status"], "confirmedShowtime": public.get("confirmedShowtime")})

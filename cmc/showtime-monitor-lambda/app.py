@@ -33,7 +33,7 @@ def handler(event, context):
         message = {
             "provider": "gracenote", "requestedBy": "upcoming-showtime-monitor", "monitoring": True,
             "monitorPK": monitor["PK"], "monitorSK": monitor["SK"], "movieNightId": night["movieNightId"],
-            "clubId": night["clubId"], "importJobId": f"monitor-{now}-{night['movieNightId']}",
+            "clubId": night["clubId"], "eventVersion": int(night.get("version", 0)), "importJobId": f"monitor-{now}-{night['movieNightId']}",
             "movieTitle": (night.get("movie") or {}).get("title", ""), "zip": planning.get("zipCode"),
             "radius": planning.get("radiusMiles"), "units": "mi", "startDate": planning.get("dateWindowStart"),
             "numDays": (datetime.strptime(planning["dateWindowEnd"], "%Y-%m-%d").date() - datetime.strptime(planning["dateWindowStart"], "%Y-%m-%d").date()).days + 1,

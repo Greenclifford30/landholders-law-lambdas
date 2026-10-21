@@ -4,12 +4,15 @@ from cmc_shared import HISTORY_STATUSES, claims, handle, path_param, public_movi
 
 
 def query_status(club_id, status):
-    result = table().query(
-        IndexName="GSI1",
-        KeyConditionExpression=Key("GSI1PK").eq(f"CLUB#{club_id}#STATUS#{status}"),
-        ScanIndexForward=False,
-    )
-    return result.get("Items", [])
+    kwargs = {"IndexName": "GSI1", "KeyConditionExpression": Key("GSI1PK").eq(f"CLUB#{club_id}#STATUS#{status}"), "ScanIndexForward": False}
+    items = []
+    while True:
+        page = table().query(**kwargs)
+        items.extend(page.get("Items", []))
+        if not page.get("LastEvaluatedKey"):
+            return items
+        kwargs["ExclusiveStartKey"] = page["LastEvaluatedKey"]
+
 
 
 @handle

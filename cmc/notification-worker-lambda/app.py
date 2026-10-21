@@ -6,6 +6,7 @@ import boto3
 from boto3.dynamodb.conditions import Key
 from botocore.exceptions import ClientError
 
+from cmc_events import all_items
 from cmc_shared import list_rsvps, list_votes, now_iso, put_item, table
 from pywebpush import WebPushException, webpush
 
@@ -51,11 +52,18 @@ def notification_copy(event):
         "rsvp_reminder": ("RSVP reminder", f"{title} is about 24 hours away. Let your club know if you are going."),
         "test_notification": ("Movie Club notification test", "This is a test of your in-app, email, and browser push notification channels."),
     }
-    return copy[kind]
+    subject, body = copy[kind]
+    previous = event.get("previousPlan")
+    if previous and kind in {"showtime_changed", "movie_night_cancelled"}:
+        body += f" Previous plan: {previous.get('theaterName', '')}, {previous.get('startsAtUtc', '')}, {previous.get('screenFormat', '')}."
+    if kind == "showtime_changed":
+        current = event.get("confirmedShowtime") or {}
+        body += f" Current plan: {current.get('theaterName', '')}, {current.get('startsAtUtc', '')}, {current.get('screenFormat', '')}. Review your tickets separately."
+    return subject, body
 
 
 def eligible_members(event):
-    members = table().query(KeyConditionExpression=Key("PK").eq(f"CLUB#{event['clubId']}") & Key("SK").begins_with("MEMBER#")).get("Items", [])
+    members = all_items(f"CLUB#{event['clubId']}", "MEMBER#")
     users = [member for member in members if member.get("status", "active") == "active"]
     if event["notificationType"] == "test_notification":
         users = [member for member in users if member.get("userId") == event.get("targetUserId")]
@@ -63,7 +71,7 @@ def eligible_members(event):
         voted = {item.get("userId") for item in list_votes(event["movieNightId"])}
         users = [member for member in users if member.get("userId") not in voted]
     if event["notificationType"] == "rsvp_reminder":
-        rsvped = {item.get("userId") for item in list_rsvps(event["movieNightId"])}
+        rsvped = {item.get("userId") for item in list_rsvps(event["movieNightId"]) if int(item.get("rsvpPlanRevision", 1)) >= int(event.get("planRevision", 1))}
         users = [member for member in users if member.get("userId") not in rsvped]
     return users
 
@@ -157,6 +165,9 @@ def deliver(event):
             if not item:
                 log("notification_record_missing_after_duplicate", eventId=event["eventId"], userId=user_id)
                 continue
+        current_member = table().get_item(Key={"PK": f"CLUB#{event['clubId']}", "SK": f"MEMBER#{user_id}"}, ConsistentRead=True).get("Item")
+        if not current_member or current_member.get("status", "active") != "active":
+            continue
         preferences = user_preferences(user_id)
         if item.get("emailStatus") != "sent":
             send_email(item, member, subject, body, link, is_reminder, preferences)
@@ -176,6 +187,12 @@ def process_outbox():
         if event.get("status") != "pending":
             continue
         pending_count += 1
+        night = table().get_item(Key={"PK": f"CLUB#{event['clubId']}", "SK": f"MOVIE_NIGHT#{event['movieNightId']}"}, ConsistentRead=True).get("Item")
+        obsolete = night and (int(event.get("calendarSequence", 0)) != int(night.get("calendarSequence", 0)) or
+                             (night.get("status") in {"cancelled", "completed"} and event["notificationType"] != "movie_night_cancelled"))
+        if obsolete:
+            table().update_item(Key={"PK": event["PK"], "SK": event["SK"]}, UpdateExpression="SET #status = :status", ExpressionAttributeNames={"#status": "status"}, ExpressionAttributeValues={":status": "superseded"})
+            continue
         if deliver(event):
             table().update_item(Key={"PK": event["PK"], "SK": event["SK"]}, UpdateExpression="SET #status = :status, deliveredAt = :at", ExpressionAttributeNames={"#status": "status"}, ExpressionAttributeValues={":status": "delivered", ":at": now_iso()})
             log("notification_outbox_delivered", eventId=event["eventId"])
@@ -191,9 +208,9 @@ def process_due():
         if reminder.get("status") != "pending":
             continue
         pending_count += 1
-        movie_night = table().get_item(Key={"PK": f"CLUB#{reminder['clubId']}", "SK": f"MOVIE_NIGHT#{reminder['movieNightId']}"}).get("Item")
+        movie_night = table().get_item(Key={"PK": f"CLUB#{reminder['clubId']}", "SK": f"MOVIE_NIGHT#{reminder['movieNightId']}"}, ConsistentRead=True).get("Item")
         expected_status = "voting" if reminder["notificationType"] == "vote_reminder" else "confirmed"
-        if movie_night and movie_night.get("status") == expected_status:
+        if movie_night and movie_night.get("status") == expected_status and int(reminder.get("calendarSequence", 0)) == int(movie_night.get("calendarSequence", 0)):
             if deliver(reminder):
                 table().update_item(Key={"PK": reminder["PK"], "SK": reminder["SK"]}, UpdateExpression="SET #status = :status, deliveredAt = :at", ExpressionAttributeNames={"#status": "status"}, ExpressionAttributeValues={":status": "delivered", ":at": now_iso()})
                 log("notification_reminder_delivered", eventId=reminder["eventId"])

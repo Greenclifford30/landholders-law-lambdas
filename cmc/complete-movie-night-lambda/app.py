@@ -1,58 +1,20 @@
-from botocore.exceptions import ClientError
-
-from cmc_shared import (
-    ADMIN_ROLES,
-    ApiError,
-    claims,
-    handle,
-    now_iso,
-    path_param,
-    public_movie_night,
-    require_movie_night_membership,
-    response,
-    table,
-)
+from cmc_shared import ADMIN_ROLES, ApiError, claims, handle, now_iso, parse_body, path_param, require_movie_night_membership, response
+from cmc_lifecycle import check_expected, commit, revision, retry_record
 
 
 @handle
 def handler(event, context):
-    movie_night_id = path_param(event, "movieNightId")
     user = claims(event)
-    movie_night, _membership = require_movie_night_membership(movie_night_id, user["userId"], ADMIN_ROLES)
+    night, membership = require_movie_night_membership(path_param(event, "movieNightId"), user["userId"], ADMIN_ROLES)
+    payload = parse_body(event)
+    retry, previous = retry_record(night, user["userId"], "complete", payload)
+    if previous:
+        return response(200, {"movieNight": previous["result"]})
+    check_expected(night, payload)
+    if night["status"] not in {"confirmed"}:
+        raise ApiError(409, "Movie night cannot be completed from its current state.")
+    updated = {**night, "status": "completed", "GSI1PK": f"CLUB#{night['clubId']}#STATUS#completed",
+               "completedAt": now_iso(), "completedBy": user["userId"]}
 
-    if movie_night.get("status") != "confirmed":
-        raise ApiError(409, "Only confirmed movie nights can be completed.")
-
-    updated_at = now_iso()
-    try:
-        table().update_item(
-            Key={"PK": movie_night["PK"], "SK": movie_night["SK"]},
-            ConditionExpression="#status = :expected",
-            UpdateExpression=(
-                "SET #status = :status, GSI1PK = :gsi1pk, completedAt = :completedAt, "
-                "completedBy = :completedBy, updatedAt = :updatedAt"
-            ),
-            ExpressionAttributeNames={"#status": "status"},
-            ExpressionAttributeValues={
-                ":status": "completed",
-                ":expected": "confirmed",
-                ":gsi1pk": f"CLUB#{movie_night['clubId']}#STATUS#completed",
-                ":completedAt": updated_at,
-                ":completedBy": user["userId"],
-                ":updatedAt": updated_at,
-            },
-        )
-    except ClientError as exc:
-        if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
-            raise ApiError(409, "Movie night changed. Reload and try again.") from exc
-        raise
-
-    completed_movie_night = {
-        **movie_night,
-        "status": "completed",
-        "GSI1PK": f"CLUB#{movie_night['clubId']}#STATUS#completed",
-        "completedAt": updated_at,
-        "completedBy": user["userId"],
-        "updatedAt": updated_at,
-    }
-    return response(200, {"movieNight": public_movie_night(completed_movie_night)})
+    result = commit(night, updated, user["userId"], membership, "complete", retry, None)
+    return response(200, {"movieNight": result})

@@ -17,8 +17,7 @@ def event_id(movie_night, notification_type):
     return f"{movie_night['movieNightId']}#{notification_type}#{sequence}"
 
 
-def enqueue_movie_notification(movie_night, notification_type):
-    """Store a deduplicated event for asynchronous recipient fan-out and delivery."""
+def notification_record(movie_night, notification_type):
     created_at = now_iso()
     identifier = event_id(movie_night, notification_type)
     item = {
@@ -36,13 +35,21 @@ def enqueue_movie_notification(movie_night, notification_type):
         "createdAt": created_at,
         "status": "pending",
     }
+    item["planRevision"] = movie_night.get("planRevision", 1 if movie_night.get("confirmedShowtimeId") or movie_night.get("status") in {"confirmed", "completed"} else 0)
+    item["calendarSequence"] = movie_night.get("calendarSequence", 0)
+    item["previousPlan"] = movie_night.get("previousPlan")
+    return item
+
+
+def enqueue_movie_notification(movie_night, notification_type):
+    item = notification_record(movie_night, notification_type)
     try:
         put_item(item, ConditionExpression="attribute_not_exists(PK) AND attribute_not_exists(SK)")
     except ClientError as exc:
         if exc.response.get("Error", {}).get("Code") != "ConditionalCheckFailedException":
             raise
         return
-    schedule_reminder(movie_night, notification_type, created_at)
+    schedule_reminder(movie_night, notification_type)
     trigger_notification_delivery()
 
 
@@ -58,7 +65,7 @@ def trigger_notification_delivery():
         return
 
 
-def schedule_reminder(movie_night, notification_type, created_at=None):
+def reminder_record(movie_night, notification_type, created_at=None):
     deadline = None
     reminder_type = None
     if notification_type == "voting_open":
@@ -87,6 +94,15 @@ def schedule_reminder(movie_night, notification_type, created_at=None):
         "createdAt": created_at or now_iso(),
         "status": "pending",
     }
+    item["planRevision"] = movie_night.get("planRevision", 1 if movie_night.get("confirmedShowtimeId") or movie_night.get("status") in {"confirmed", "completed"} else 0)
+    item["calendarSequence"] = movie_night.get("calendarSequence", 0)
+    return item
+
+
+def schedule_reminder(movie_night, notification_type, created_at=None):
+    item = reminder_record(movie_night, notification_type, created_at)
+    if not item:
+        return
     try:
         put_item(item, ConditionExpression="attribute_not_exists(PK) AND attribute_not_exists(SK)")
     except ClientError as exc:

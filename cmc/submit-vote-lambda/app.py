@@ -1,3 +1,6 @@
+from botocore.exceptions import ClientError
+from cmc_events import member_check
+from cmc_lifecycle import version_check
 from cmc_shared import (
     ApiError,
     claims,
@@ -8,7 +11,7 @@ from cmc_shared import (
     parse_body,
     path_param,
     public_movie_night,
-    put_item,
+    transact_write_items,
     require_movie_night_membership,
     response,
     voting_is_closed,
@@ -55,5 +58,10 @@ def handler(event, context):
         "rankings": ranked_ids,
         "updatedAt": saved_at,
     }
-    put_item(item)
+    try:
+        transact_write_items(puts=[{"Item": item}], checks=[version_check(movie_night), member_check(movie_night["clubId"], user["userId"], _membership)])
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") == "TransactionCanceledException":
+            raise ApiError(409, "Movie night changed. Reload before voting.") from exc
+        raise
     return response(200, {"vote": public_movie_night(item)})

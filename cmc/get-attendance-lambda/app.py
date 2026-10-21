@@ -1,3 +1,4 @@
+from cmc_lifecycle import revision
 from cmc_shared import (
     ADMIN_ROLES,
     claims,
@@ -27,6 +28,8 @@ def handler(event, context):
         "pending": 0,
         "purchased": 0,
         "notPurchased": 0,
+        "needsReconfirmation": 0,
+        "ticketsNeedReview": 0,
     }
     for membership in memberships:
         if membership.get("status", "active") != "active":
@@ -35,6 +38,15 @@ def handler(event, context):
         rsvp = rsvps.get(user_id) or {}
         rsvp_status = rsvp.get("status", "pending")
         ticket_status = rsvp.get("ticketStatus", "not_purchased")
+        needs_reconfirmation = bool(rsvp) and int(rsvp.get("rsvpPlanRevision", 1)) < revision(movie_night)
+        tickets_need_review = bool(rsvp) and int(rsvp.get("ticketPlanRevision", 1)) < revision(movie_night)
+        prior_status, prior_ticket = rsvp_status, ticket_status
+        if needs_reconfirmation:
+            summary["needsReconfirmation"] += 1
+            rsvp_status = "pending"
+        if tickets_need_review:
+            summary["ticketsNeedReview"] += 1
+            ticket_status = "not_purchased"
         summary["totalMembers"] += 1
         summary[{"not_going": "notGoing"}.get(rsvp_status, rsvp_status)] += 1
         if ticket_status == "purchased":
@@ -50,6 +62,10 @@ def handler(event, context):
                 "rsvpStatus": rsvp_status,
                 "ticketStatus": ticket_status,
                 "updatedAt": rsvp.get("updatedAt"),
+                "needsReconfirmation": needs_reconfirmation,
+                "ticketsNeedReview": tickets_need_review,
+                "priorRsvpStatus": prior_status if needs_reconfirmation else None,
+                "priorTicketStatus": prior_ticket if tickets_need_review else None,
             }
         )
     members.sort(key=lambda item: ((item["name"] or item["email"]).lower(), item["userId"]))

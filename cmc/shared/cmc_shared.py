@@ -302,6 +302,8 @@ def active_pointer(club_id):
     # Legacy callers receive a projection selected from real event records.
     from cmc_events import upcoming_nights
     nights = upcoming_nights(club_id)
+    from cmc_events import compatibility_order
+    nights.sort(key=compatibility_order)
     return nights[0] if nights else None
 
 
@@ -397,13 +399,19 @@ def normalize_planning_input(payload, existing=None):
     if not isinstance(preferred_theater_ids, list):
         raise ApiError(400, "preferredTheaterIds must be a list.")
 
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+    timezone_name = str(payload.get("timezone", existing.get("timezone", "America/Chicago"))).strip() or "America/Chicago"
+    try:
+        ZoneInfo(timezone_name)
+    except (ZoneInfoNotFoundError, ValueError) as exc:
+        raise ApiError(400, "timezone must be a valid IANA timezone.") from exc
     return {
         "targetDate": target_date,
         "dateWindowStart": date_window_start,
         "dateWindowEnd": date_window_end,
         "zipCode": zip_code,
         "radiusMiles": radius_miles,
-        "timezone": str(payload.get("timezone", existing.get("timezone", "America/Chicago"))).strip() or "America/Chicago",
+        "timezone": timezone_name,
         "preferredFormats": [str(item).strip() for item in preferred_formats if str(item).strip()],
         "preferredTheaterIds": [str(item).strip() for item in preferred_theater_ids if str(item).strip()],
     }
@@ -444,6 +452,13 @@ def normalize_movie_snapshot(payload):
 
 
 def public_movie_night(item):
+    item = dict(item)
+    if item.get("movieNightId") and item.get("movie"):
+        item.setdefault("version", 0)
+        item.setdefault("planRevision", 1 if item.get("confirmedShowtimeId") or item.get("status") in {"confirmed", "completed"} else 0)
+    if str(item.get("SK", "")).startswith("RSVP#"):
+        item.setdefault("rsvpPlanRevision", 1)
+        item.setdefault("ticketPlanRevision", 1)
     return {
         key: value
         for key, value in item.items()

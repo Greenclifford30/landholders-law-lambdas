@@ -34,6 +34,9 @@ class FakeKey:
     def eq(self, value):
         return KeyExpression([(self.name, "eq", value)])
 
+    def lte(self, value):
+        return KeyExpression([(self.name, "lte", value)])
+
     def begins_with(self, value):
         return KeyExpression([(self.name, "begins_with", value)])
 
@@ -117,7 +120,7 @@ class FakeTable:
         return {}
 
     def _condition_matches(self, condition, existing, put):
-        if condition == "attribute_not_exists(PK) AND attribute_not_exists(SK)":
+        if condition in {"attribute_not_exists(PK) AND attribute_not_exists(SK)", "attribute_not_exists(PK)"}:
             return existing is None
         if condition == "attribute_not_exists(PK) OR NOT (#status IN (:planning, :voting, :confirmed))":
             if existing is None:
@@ -135,6 +138,11 @@ class FakeTable:
         names = put.get("ExpressionAttributeNames") or {}
         values = put.get("ExpressionAttributeValues") or {}
         for clause in condition.split(" AND "):
+            if clause.startswith("attribute_not_exists("):
+                attribute = clause[len("attribute_not_exists("):-1]
+                if names.get(attribute, attribute) in existing:
+                    return False
+                continue
             attribute, value_key = [part.strip() for part in clause.split("=", 1)]
             if existing.get(names.get(attribute, attribute)) != values[value_key]:
                 return False
@@ -177,6 +185,8 @@ class FakeTable:
         for item in self.items.values():
             ok = True
             for attr, op, value in conditions:
+                if op == "lte" and str(item.get(attr, "")) > value:
+                    ok = False
                 if op == "eq" and item.get(attr) != value:
                     ok = False
                 if op == "begins_with" and not str(item.get(attr, "")).startswith(value):
@@ -265,7 +275,7 @@ def install_fake_aws(fake_table):
 
 def load_app(lambda_dir, fake_table):
     install_fake_aws(fake_table)
-    for name in ("cmc_shared", "cmc_events", "cmc_movies", "cmc_proposals", "cmc_notifications"):
+    for name in ("cmc_shared", "cmc_events", "cmc_movies", "cmc_proposals", "cmc_notifications", "cmc_lifecycle"):
         sys.modules.pop(name, None)
     sys.path.insert(0, str(CMC_DIR / "shared"))
     module_path = CMC_DIR / lambda_dir / "app.py"

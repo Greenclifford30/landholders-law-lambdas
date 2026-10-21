@@ -440,7 +440,7 @@ def import_movie_night_candidates(items, message):
 
 
 def finish_monitor(message, summary):
-    if not message.get("monitoring"):
+    if not message.get("monitoring") or not event_work_is_current(message):
         return
     app_table = dynamodb.Table(get_required_env("APP_TABLE_NAME"))
     now = now_iso()
@@ -468,12 +468,30 @@ def finish_monitor(message, summary):
     app_table.update_item(Key=night_key, UpdateExpression="SET showtimeMonitoring = :monitoring, updatedAt = :now", ExpressionAttributeValues={":monitoring": {"status": "active", "lastCheckedAt": now, "nextCheckAt": next_check, "resultCount": 0}, ":now": now})
 
 
+def event_work_is_current(message):
+    if not message.get("movieNightId"):
+        return True
+    app_table = dynamodb.Table(get_required_env("APP_TABLE_NAME"))
+    night = app_table.get_item(Key={"PK": f"CLUB#{message['clubId']}", "SK": f"MOVIE_NIGHT#{message['movieNightId']}"}, ConsistentRead=True).get("Item")
+    if not night or night.get("status") not in {"planning", "voting"}:
+        return False
+    if message.get("eventVersion") is not None and int(message["eventVersion"]) != int(night.get("version", 0)):
+        return False
+    if message.get("monitoring") and (night.get("status") != "planning" or (night.get("showtimeMonitoring") or {}).get("status") != "active"):
+        return False
+    return True
+
+
 def process_record(record):
     message = parse_message(record)
+    if not event_work_is_current(message):
+        return
     update_import_state(message, "running")
     response_data = call_gracenote(message)
     items = normalize_items(response_data, message)
     write_items(items)
+    if not event_work_is_current(message):
+        return
     summary = import_movie_night_candidates(items, message)
     finish_monitor(message, summary)
     logger.info(

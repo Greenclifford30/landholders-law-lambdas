@@ -1,3 +1,7 @@
+from botocore.exceptions import ClientError
+from cmc_lifecycle import check_expected, version_check
+from cmc_events import all_items, member_check, should_monitor
+from cmc_shared import transact_write_items
 import hashlib
 import json
 import os
@@ -239,6 +243,7 @@ def write_candidates(movie_night, candidates):
 def update_movie_night(movie_night, fields):
     if not fields:
         return movie_night
+    fields = {**fields, "version": int(movie_night.get("version", 0)) + 1}
     names = {}
     values = {}
     assignments = []
@@ -246,12 +251,18 @@ def update_movie_night(movie_night, fields):
         names[f"#{key}"] = key
         values[f":{key}"] = dynamodb_value(value)
         assignments.append(f"#{key} = :{key}")
-    table().update_item(
-        Key={"PK": movie_night["PK"], "SK": movie_night["SK"]},
-        UpdateExpression="SET " + ", ".join(assignments),
-        ExpressionAttributeNames=names,
-        ExpressionAttributeValues=values,
-    )
+    try:
+        table().update_item(
+            Key={"PK": movie_night["PK"], "SK": movie_night["SK"]},
+            UpdateExpression="SET " + ", ".join(assignments),
+            ExpressionAttributeNames={**names, **version_check(movie_night)["ExpressionAttributeNames"]},
+            ExpressionAttributeValues={**values, **version_check(movie_night)["ExpressionAttributeValues"]},
+            ConditionExpression=version_check(movie_night)["ConditionExpression"],
+        )
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+            raise ApiError(409, "Movie night changed. Reload and try again.") from exc
+        raise
     return {**movie_night, **{key: dynamodb_value(value) for key, value in fields.items()}}
 
 
@@ -278,25 +289,42 @@ def delete_movie_night_children(movie_night_id, prefixes):
         table().delete_item(Key={"PK": item["PK"], "SK": item["SK"]})
 
 
-def handle_update_planning(movie_night, payload):
+def handle_update_planning(movie_night, payload, user_id, membership):
+    check_expected(movie_night, payload, "version")
     if movie_night.get("status") != "planning":
         raise ApiError(409, "Planning can only be changed while the movie night is in setup.")
-    updated_at = now_iso()
-    planning = normalize_planning_input(payload.get("planning") or payload, movie_night)
-    fields = {**planning, "updatedAt": updated_at}
+    fields = normalize_planning_input(payload.get("planning") or payload, movie_night)
+    deletes = []
+    additional_puts = []
     if "movie" in payload or "selectedMovie" in payload:
         movie = normalize_movie_snapshot(payload)
         if movie_identity(movie) != movie_identity(movie_night.get("movie")):
-            delete_movie_night_children(movie_night["movieNightId"], ("SHOWTIME#", "SHOWTIME_IMPORT#"))
-            fields.update(
-                {
-                    "movie": movie,
-                    "showtimeMonitoring": sync_showtime_monitor(movie_night, movie, updated_at),
-                    "showtimeImportStatus": "idle",
-                    "lastShowtimeImportSummary": {},
-                }
-            )
-    updated = update_movie_night(movie_night, fields)
+            children = [item for prefix in ("SHOWTIME#", "SHOWTIME_IMPORT#", "VOTE#") for item in all_items(movie_night_pk(movie_night["movieNightId"]), prefix)]
+            if len(children) > 95:
+                raise ApiError(409, "This event has too many imported records to replace its film. Create a new night.")
+            deletes = [{"Key": {"PK": item["PK"], "SK": item["SK"]}} for item in children]
+            fields.update(movie=movie, showtimeMonitoring={"status": "disabled"}, showtimeImportStatus="idle", lastShowtimeImportSummary={})
+            at = now_iso()
+            monitors = [m for m in all_items("SHOWTIME_MONITOR", "CHECK#") if m.get("movieNightId") == movie_night["movieNightId"]]
+            deletes.extend({"Key": {"PK": m["PK"], "SK": m["SK"]}} for m in monitors)
+            if should_monitor(movie):
+                fields["showtimeMonitoring"] = {"status": "active", "nextCheckAt": at, "resultCount": 0}
+                monitor = {"PK": "SHOWTIME_MONITOR", "SK": f"CHECK#{at}#MOVIE_NIGHT#{movie_night['movieNightId']}",
+                           "movieNightId": movie_night["movieNightId"], "clubId": movie_night["clubId"], "status": "active",
+                           "nextCheckAt": at, "createdAt": at, "updatedAt": at}
+                deletes = [d for d in deletes if d["Key"] != {"PK": monitor["PK"], "SK": monitor["SK"]}]
+                additional_puts.append({"Item": monitor})
+    if len(deletes) + len(additional_puts) > 98:
+        raise ApiError(409, "This event has too many imported records to replace its film. Create a new night.")
+    updated = {**movie_night, **fields, "version": int(movie_night.get("version", 0)) + 1, "updatedAt": now_iso()}
+    condition = version_check(movie_night)
+    try:
+        transact_write_items(puts=[{"Item": updated, **{k: v for k, v in condition.items() if k != "Key"}}, *additional_puts],
+                             deletes=deletes, checks=[member_check(movie_night["clubId"], user_id, membership)])
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") == "TransactionCanceledException":
+            raise ApiError(409, "Movie night changed. Reload and try again.") from exc
+        raise
     return response(200, {"movieNight": public_movie_night(updated)})
 
 
@@ -438,6 +466,7 @@ def handle_import(movie_night):
         "startDate": planning["dateWindowStart"],
         "numDays": len(requested_dates),
         "requestedBy": "movie-night-import",
+        "eventVersion": updated.get("version", 0),
         "movieNightId": movie_night["movieNightId"],
         "clubId": movie_night["clubId"],
         "importJobId": job["importJobId"],
@@ -568,7 +597,7 @@ def handler(event, context):
     action = action_from_event(event, payload)
 
     if action == "updatePlanning":
-        return handle_update_planning(movie_night, payload)
+        return handle_update_planning(movie_night, payload, user["userId"], _membership)
     if action == "import":
         return handle_import(movie_night)
     if action == "approve":

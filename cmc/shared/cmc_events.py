@@ -18,10 +18,25 @@ def all_items(pk, prefix):
         kwargs["ExclusiveStartKey"] = page["LastEvaluatedKey"]
 
 
-def night_order(night):
+def compatibility_order(night):
     start = (night.get("confirmedShowtime") or {}).get("startsAtUtc") or (night.get("confirmedShowtime") or {}).get("startsAt")
     date = start or night.get("targetDate") or ""
     return (0 if night.get("status") == "confirmed" else 1 if date else 2, date, night["movieNightId"])
+
+
+def night_order(night):
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+    from cmc_shared import parse_iso_datetime
+    showtime = night.get("confirmedShowtime") or {}
+    start = parse_iso_datetime(showtime.get("startsAtUtc") or showtime.get("startsAt"))
+    date = night.get("targetDate") or night.get("dateWindowStart")
+    if not start and date:
+        try:
+            start = datetime.strptime(date, "%Y-%m-%d").replace(tzinfo=ZoneInfo(night.get("timezone") or "America/Chicago"))
+        except (ValueError, ZoneInfoNotFoundError):
+            start = parse_iso_datetime(date)
+    key = start.astimezone(timezone.utc).isoformat() if start else ""
+    return (0 if start else 1, key, night["movieNightId"])
 
 
 def upcoming_nights(club_id):
@@ -62,7 +77,7 @@ def event_detail(night, membership, user_id, include_showtimes=True):
     rsvp = get_item(f"MOVIE_NIGHT#{identifier}", f"RSVP#{user_id}")
     return {"movieNight": public_movie_night(night), "showtimes": [public_movie_night(s) for s in all_items(f"MOVIE_NIGHT#{identifier}", "SHOWTIME#") if s.get("status", "approved") in statuses] if include_showtimes else [],
             "currentUserVote": public_movie_night(vote) if vote else None, "currentUserRsvp": public_movie_night(rsvp) if rsvp else None,
-            "currentUserRole": membership.get("role")}
+            "currentUserRole": membership.get("role"), "currentUserAcknowledgement": public_movie_night(get_item(f"MOVIE_NIGHT#{identifier}", f"ACK#{user_id}") or {})}
 
 
 def should_monitor(movie):
@@ -122,3 +137,30 @@ def member_check(club_id, user_id, membership):
             "ConditionExpression": "#role = :role AND (attribute_not_exists(#status) OR #status = :active)",
             "ExpressionAttributeNames": {"#role": "role", "#status": "status"},
             "ExpressionAttributeValues": {":role": membership["role"], ":active": "active"}}
+
+
+def add_conflicts(nights, personal=False):
+    from datetime import timedelta
+    from cmc_shared import parse_iso_datetime
+    eligible = [n for n in nights if n.get("status") == "confirmed" and
+                (not personal or (n.get("currentUserRsvp") or {}).get("status") in {"going", "maybe"})]
+    for night in nights:
+        night["conflicts"] = []
+    for index, left in enumerate(eligible):
+        for right in eligible[index + 1:]:
+            first, second = left, right
+            start = parse_iso_datetime((first.get("confirmedShowtime") or {}).get("startsAtUtc"))
+            other = parse_iso_datetime((second.get("confirmedShowtime") or {}).get("startsAtUtc"))
+            if not start or not other:
+                continue
+            if start > other:
+                first, second, start, other = second, first, other, start
+            runtime = (first.get("movie") or {}).get("runtime")
+            known = isinstance(runtime, (int, float)) or hasattr(runtime, "as_tuple")
+            known = known and runtime > 0
+            if known and start + timedelta(minutes=float(runtime)) <= other:
+                continue
+            uncertain = not known and start != other
+            left["conflicts"].append({"movieNightId": right["movieNightId"], "uncertain": uncertain})
+            right["conflicts"].append({"movieNightId": left["movieNightId"], "uncertain": uncertain})
+    return nights

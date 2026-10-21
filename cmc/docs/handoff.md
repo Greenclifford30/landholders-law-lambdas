@@ -398,3 +398,7 @@ GET /clubs/{clubId}/movie-nights/active
 - Whether Lambda artifacts are built manually, by CI, or by Terraform `archive_file`.
 - Whether shared code is vendored into each Lambda zip or moved into a Lambda layer.
 - The exact Cognito group/claim convention for Admin, Friend, and Guest roles.
+
+## Collaboration backend update — October 19, 2026
+
+Film proposals and the parallel-night foundation are implemented locally. See [collaboration-backend.md](collaboration-backend.md) for routes, transaction/storage design, live pagination behavior, compatibility rules, test commands, and the coordinated deployment/rollback procedure. Deployment has not been performed. The old active-night pointer is no longer authoritative; deploying old single-active handlers alongside the new handlers is not supported.

@@ -1,25 +1,21 @@
-from botocore.exceptions import ClientError
-
-from cmc_notifications import enqueue_movie_notification
-from cmc_shared import ADMIN_ROLES, ApiError, claims, handle, now_iso, path_param, public_movie_night, require_movie_night_membership, response, transact_update_items
+from cmc_shared import ADMIN_ROLES, ApiError, claims, handle, now_iso, parse_body, path_param, require_movie_night_membership, response
+from cmc_lifecycle import check_expected, commit, revision, retry_record
 
 
 @handle
 def handler(event, context):
-    movie_night_id = path_param(event, "movieNightId")
     user = claims(event)
-    movie_night, _membership = require_movie_night_membership(movie_night_id, user["userId"], ADMIN_ROLES)
-    if movie_night.get("status") not in {"planning", "voting", "confirmed"}:
-        raise ApiError(409, "Only an active movie night can be cancelled.")
-    updated_at = now_iso()
-    try:
-        transact_update_items([
-            {"Key": {"PK": movie_night["PK"], "SK": movie_night["SK"]}, "UpdateExpression": "SET #status = :status, GSI1PK = :gsi, cancelledAt = :at, cancelledBy = :by, updatedAt = :at", "ExpressionAttributeNames": {"#status": "status"}, "ExpressionAttributeValues": {":status": "cancelled", ":gsi": f"CLUB#{movie_night['clubId']}#STATUS#cancelled", ":at": updated_at, ":by": user["userId"], ":expected": movie_night["status"]}, "ConditionExpression": "#status = :expected"},
-        ])
-    except ClientError as exc:
-        if exc.response.get("Error", {}).get("Code") == "TransactionCanceledException":
-            raise ApiError(409, "Movie night changed. Reload and try again.") from exc
-        raise
-    updated = {**movie_night, "status": "cancelled", "cancelledAt": updated_at, "cancelledBy": user["userId"], "updatedAt": updated_at}
-    enqueue_movie_notification(updated, "movie_night_cancelled")
-    return response(200, {"movieNight": public_movie_night(updated)})
+    night, membership = require_movie_night_membership(path_param(event, "movieNightId"), user["userId"], ADMIN_ROLES)
+    payload = parse_body(event)
+    retry, previous = retry_record(night, user["userId"], "cancel", payload)
+    if previous:
+        return response(200, {"movieNight": previous["result"]})
+    check_expected(night, payload)
+    if night["status"] not in {"planning", "voting", "confirmed"}:
+        raise ApiError(409, "Movie night cannot be cancelled from its current state.")
+    updated = {**night, "status": "cancelled", "GSI1PK": f"CLUB#{night['clubId']}#STATUS#cancelled",
+               "cancelledAt": now_iso(), "cancelledBy": user["userId"]}
+    updated.update(planRevision=revision(night) + 1, calendarSequence=int(night.get("calendarSequence", 0)) + 1,
+                       previousPlan=night.get("confirmedShowtime"))
+    result = commit(night, updated, user["userId"], membership, "cancel", retry, 'movie_night_cancelled')
+    return response(200, {"movieNight": result})
