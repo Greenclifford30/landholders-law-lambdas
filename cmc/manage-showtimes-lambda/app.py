@@ -34,10 +34,25 @@ from cmc_shared import (
     table,
 )
 from cmc_notifications import enqueue_movie_notification
+from cmc_availability import enqueue_availability_sync
 
 
 CLOSED_STATUSES = {"confirmed", "completed", "cancelled"}
 sqs = boto3.client("sqs")
+
+
+def bump_availability_revision(movie_night, reason="showtimes_changed"):
+    latest = get_item(movie_night["PK"], movie_night["SK"]) or movie_night
+    result = table().update_item(
+        Key={"PK": latest["PK"], "SK": latest["SK"]},
+        UpdateExpression="SET availabilityRevision = if_not_exists(availabilityRevision, :base) + :increment, updatedAt = :updatedAt",
+        ExpressionAttributeValues={":base": 1, ":increment": 1, ":updatedAt": now_iso()},
+        ReturnValues="UPDATED_NEW",
+    )
+    revision = int(result["Attributes"]["availabilityRevision"])
+    movie_night["availabilityRevision"] = revision
+    enqueue_availability_sync(movie_night_id=movie_night["movieNightId"], reason=reason)
+    return revision
 
 
 def is_upcoming_movie(movie):
@@ -237,6 +252,8 @@ def write_candidates(movie_night, candidates):
             else:
                 imported_count += 1
             batch.put_item(Item=candidate)
+    if candidates:
+        bump_availability_revision(movie_night)
     return imported_count, duplicate_count
 
 
@@ -314,6 +331,8 @@ def handle_update_planning(movie_night, payload, user_id, membership):
                            "nextCheckAt": at, "createdAt": at, "updatedAt": at}
                 deletes = [d for d in deletes if d["Key"] != {"PK": monitor["PK"], "SK": monitor["SK"]}]
                 additional_puts.append({"Item": monitor})
+    if fields.get("movie") != movie_night.get("movie") and fields.get("movie") is not None:
+        fields["availabilityRevision"] = int(movie_night.get("availabilityRevision", 1)) + 1
     if len(deletes) + len(additional_puts) > 98:
         raise ApiError(409, "This event has too many imported records to replace its film. Create a new night.")
     updated = {**movie_night, **fields, "version": int(movie_night.get("version", 0)) + 1, "updatedAt": now_iso()}
@@ -325,6 +344,8 @@ def handle_update_planning(movie_night, payload, user_id, membership):
         if exc.response.get("Error", {}).get("Code") == "TransactionCanceledException":
             raise ApiError(409, "Movie night changed. Reload and try again.") from exc
         raise
+    if updated.get("availabilityRevision") != movie_night.get("availabilityRevision"):
+        enqueue_availability_sync(movie_night_id=movie_night["movieNightId"], reason="movie_changed")
     return response(200, {"movieNight": public_movie_night(updated)})
 
 
@@ -488,6 +509,8 @@ def update_candidate_status(movie_night, showtime_id, status):
         ExpressionAttributeNames={"#status": "status"},
         ExpressionAttributeValues={":status": status, ":updatedAt": updated_at},
     )
+    if item.get("status", "approved") != status:
+        bump_availability_revision(movie_night)
     return {**item, "status": status, "updatedAt": updated_at}
 
 

@@ -287,6 +287,7 @@ def public_club(item, membership=None):
     if membership:
         body["role"] = membership.get("role")
         body["membershipStatus"] = membership.get("status", "active")
+        body["shareCalendarAvailability"] = membership.get("shareCalendarAvailability", False)
     return body
 
 

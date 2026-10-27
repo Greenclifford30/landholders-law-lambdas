@@ -152,9 +152,12 @@ class FakeTable:
         item = self.items.get((Key["PK"], Key["SK"]))
         return {"Item": dict(item)} if item else {}
 
-    def delete_item(self, Key):
+    def delete_item(self, Key, ConditionExpression=None, ReturnValues=None):
+        existing = self.items.get((Key["PK"], Key["SK"]))
+        if ConditionExpression == "attribute_exists(PK)" and not existing:
+            raise FakeClientError({"Error": {"Code": "ConditionalCheckFailedException"}}, "DeleteItem")
         self.items.pop((Key["PK"], Key["SK"]), None)
-        return {}
+        return {"Attributes": dict(existing)} if ReturnValues == "ALL_OLD" and existing else {}
 
     def update_item(self, Key, ExpressionAttributeValues, ExpressionAttributeNames=None, **kwargs):
         item = self.items[(Key["PK"], Key["SK"])]
@@ -170,6 +173,10 @@ class FakeTable:
             if placeholder.startswith(":"):
                 continue
         update_expr = kwargs.get("UpdateExpression", "")
+        if "if_not_exists(availabilityRevision" in update_expr:
+            item["availabilityRevision"] = item.get("availabilityRevision", ExpressionAttributeValues[":base"]) + ExpressionAttributeValues[":increment"]
+            item["updatedAt"] = ExpressionAttributeValues[":updatedAt"]
+            return {"Attributes": {"availabilityRevision": item["availabilityRevision"], "updatedAt": item["updatedAt"]}}
         assignments = update_expr.replace("SET ", "").split(", ")
         for assignment in assignments:
             if not assignment:
@@ -230,10 +237,20 @@ class FakeDynamoClient:
 
 class FakeSecrets:
     def get_secret_value(self, SecretId):
+        if "google" in SecretId.lower():
+            return {"SecretString": '{"client_id":"google-client","client_secret":"google-secret"}'}
         return {"SecretString": '{"access_token":"tmdb-token"}'}
 
     def send_message(self, **kwargs):
         return {"MessageId": "fake-message"}
+
+
+class FakeKms:
+    def encrypt(self, Plaintext, **kwargs):
+        return {"CiphertextBlob": b"encrypted:" + Plaintext}
+
+    def decrypt(self, CiphertextBlob, **kwargs):
+        return {"Plaintext": CiphertextBlob.removeprefix(b"encrypted:")}
 
 
 class FakeCognito:
@@ -259,6 +276,8 @@ def install_fake_aws(fake_table):
         if service_name == "ses"
         else fake_cognito
         if service_name == "cognito-idp"
+        else FakeKms()
+        if service_name == "kms"
         else FakeSecrets(),
     )
     fake_conditions = types.SimpleNamespace(Key=FakeKey)
@@ -275,7 +294,7 @@ def install_fake_aws(fake_table):
 
 def load_app(lambda_dir, fake_table):
     install_fake_aws(fake_table)
-    for name in ("cmc_shared", "cmc_events", "cmc_movies", "cmc_proposals", "cmc_notifications", "cmc_lifecycle"):
+    for name in ("cmc_shared", "cmc_events", "cmc_movies", "cmc_proposals", "cmc_notifications", "cmc_lifecycle", "cmc_availability"):
         sys.modules.pop(name, None)
     sys.path.insert(0, str(CMC_DIR / "shared"))
     module_path = CMC_DIR / lambda_dir / "app.py"

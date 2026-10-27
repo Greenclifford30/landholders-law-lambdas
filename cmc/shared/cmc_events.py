@@ -108,6 +108,7 @@ def build_night(club_id, user_id, payload, movie):
         "movie": movie,
         **planning,
         "showtimeImportStatus": "idle",
+        "availabilityRevision": 1,
         "lastShowtimeImportSummary": {},
         "createdAt": created_at,
         "createdBy": user_id,

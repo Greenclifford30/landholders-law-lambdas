@@ -3,6 +3,7 @@ import re
 from boto3.dynamodb.conditions import Key
 from botocore.exceptions import ClientError
 
+from cmc_availability import enqueue_availability_sync
 from cmc_events import upcoming_nights, compatibility_order
 from cmc_shared import (
     ApiError,
@@ -14,6 +15,7 @@ from cmc_shared import (
     now_iso,
     parse_body,
     public_club,
+    require_membership,
     require_platform_admin,
     response,
     table,
@@ -96,10 +98,35 @@ def create_club(event, user):
     return response(201, {"club": public_club(club_item, membership_item)})
 
 
+def update_my_membership(event, user):
+    club_id = str((event.get("pathParameters") or {}).get("clubId") or "").strip()
+    if not club_id:
+        raise ApiError(400, "clubId is required.")
+    membership = require_membership(club_id, user["userId"])
+    payload = parse_body(event)
+    share = payload.get("shareCalendarAvailability")
+    if not isinstance(share, bool):
+        raise ApiError(400, "shareCalendarAvailability must be a boolean.")
+    membership = {**membership, "shareCalendarAvailability": share, "updatedAt": now_iso()}
+    table().put_item(Item=membership)
+    enqueue_availability_sync(user_id=user["userId"], reason="club_sharing_changed")
+    return response(200, {"membership": {
+        "clubId": club_id,
+        "userId": user["userId"],
+        "role": membership.get("role"),
+        "status": membership.get("status", "active"),
+        "shareCalendarAvailability": share,
+        "updatedAt": membership["updatedAt"],
+    }})
+
+
 @handle
 def handler(event, context):
     user = claims(event)
     method = (event.get("httpMethod") or event.get("requestContext", {}).get("http", {}).get("method") or "GET").upper()
+    path = event.get("path") or event.get("rawPath") or ""
+    if method == "PATCH" and path.rstrip("/").endswith("/members/me"):
+        return update_my_membership(event, user)
     if method == "POST":
         return create_club(event, user)
     return response(200, {"clubs": list_user_clubs(user["userId"]), "isPlatformAdmin": is_platform_admin(user)})

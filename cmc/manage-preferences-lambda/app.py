@@ -1,6 +1,7 @@
 import re
 
 from cmc_shared import ApiError, claims, get_item, handle, now_iso, parse_body, put_item, response
+from cmc_availability import enqueue_availability_sync, scheduling_preferences
 
 
 ZIP_CODE_RE = re.compile(r"^\d{5}(?:-\d{4})?$")
@@ -19,6 +20,7 @@ def public_preferences(item):
         "preferredFormats": item.get("preferredFormats", []),
         "reminderEmailsEnabled": item.get("reminderEmailsEnabled", True),
         "pushNotificationsEnabled": item.get("pushNotificationsEnabled", False),
+        **scheduling_preferences(item),
         "updatedAt": item.get("updatedAt"),
     }
 
@@ -86,6 +88,7 @@ def update_preferences(event, user_id):
         push_subscription = normalize_push_subscription(payload["pushSubscription"])
     if push_notifications_enabled and not push_subscription:
         raise ApiError(400, "A pushSubscription is required to enable push notifications.")
+    scheduling = scheduling_preferences({**existing, **payload})
     item = {
         "PK": preferences_pk(user_id),
         "SK": PREFERENCES_SK,
@@ -96,11 +99,13 @@ def update_preferences(event, user_id):
         "preferredFormats": normalized_formats,
         "reminderEmailsEnabled": reminder_emails_enabled,
         "pushNotificationsEnabled": push_notifications_enabled,
+        **scheduling,
         "updatedAt": updated_at,
     }
     if push_subscription:
         item["pushSubscription"] = push_subscription
     put_item(item)
+    enqueue_availability_sync(user_id=user_id, reason="preferences_changed")
     return response(200, {"preferences": public_preferences(item)})
 
 
